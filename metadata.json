@@ -1,0 +1,8 @@
+{
+  "name": "Marmot RAG",
+  "description": "A high-precision enterprise RAG management dashboard and interactive document chunking, indexing, and query playground.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
