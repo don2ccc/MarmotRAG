@@ -3,6 +3,12 @@ import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import { initDb, upsertChunk, searchChunks, deleteChunksBySource, upsertSource, loadSources, deleteSource, countSources } from "./src/db.js";
+import { embedText } from "./src/embeddings.js";
+// pdf-parse v1 is CJS; access the function via .default when loaded as ESM
+import { createRequire } from "module";
+const _require = createRequire(import.meta.url);
+const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = _require("pdf-parse");
 
 dotenv.config();
 
@@ -66,8 +72,11 @@ interface QueryLog {
   retrievedChunks: { text: string; sourceName: string; score: number }[];
 }
 
-// Seed Initial Data Sources (including a document with real HTML and hotlinked images)
-let dataSources: SourceDoc[] = [
+// dataSources is populated from DB at startup by initializeSources()
+let dataSources: SourceDoc[] = [];
+
+// Seed documents — written to DB only when marmot_sources is empty (first run ever)
+const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
   {
     id: "src-1",
     name: "Q3 Financial Reports",
@@ -78,7 +87,6 @@ let dataSources: SourceDoc[] = [
     owner: "You",
     ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCUZfI40ZWgWIDJa9qAzScBenlksgTyw_ZjF1AYj9rj4vCTl6wZxKDgFBZpZlSBlYev_bfIafWaYRsnrWPZBoAc0ZbuwqbkwPXveoPjiO_YWKUF0Y4kefUnFCO6PdAN3kzoe6izqFyK2vK5zfYVlcZPQJdAgJshkBloQ6ERj6IhwjyffFbxRfbjqH03mzWd_9zHkPUEefX1dr6O20QnzW3vjN2U23n40Nt2nVNcnYrymJjWwbdsGeaa",
     content: "RAG Enterprise Financial Report for Q3 2026. Revenues increased by 15.4% quarter-over-quarter, reaching a historic high of $42.6 million. Operation costs were kept under control, decreasing overall system latency and optimizing API credit costs. Standard compliance was fully met across tier 3 data center regions.",
-    chunks: []
   },
   {
     id: "src-2",
@@ -90,7 +98,6 @@ let dataSources: SourceDoc[] = [
     owner: "You",
     ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCUZfI40ZWgWIDJa9qAzScBenlksgTyw_ZjF1AYj9rj4vCTl6wZxKDgFBZpZlSBlYev_bfIafWaYRsnrWPZBoAc0ZbuwqbkwPXveoPjiO_YWKUF0Y4kefUnFCO6PdAN3kzoe6izqFyK2vK5zfYVlcZPQJdAgJshkBloQ6ERj6IhwjyffFbxRfbjqH03mzWd_9zHkPUEefX1dr6O20QnzW3vjN2U23n40Nt2nVNcnYrymJjWwbdsGeaa",
     content: "Customer support rules require a Microsoft Entra or Okta Single Sign-On (SSO) for authentication. Secondary work policy states that employees must request written super-admin permission before taking on external development work to ensure there is no IP collision. Latency fallback mode switches automatically to the Azure AI Search vector database if primary Pinecone API response latency exceeds 500ms.",
-    chunks: []
   },
   {
     id: "src-4",
@@ -114,7 +121,6 @@ let dataSources: SourceDoc[] = [
 <div class="image-container">
   <img src="https://images.unsplash.com/photo-1544383835-bda2bc66a55d?auto=format&fit=crop&w=800&q=80" alt="Security Guard Audit Layout Map" />
 </div>`,
-    chunks: []
   },
   {
     id: "src-3",
@@ -126,34 +132,8 @@ let dataSources: SourceDoc[] = [
     owner: "Sarah K.",
     ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuD9HiY5NXFEBD_jBLR73RLjTyaUuFkDAGR3xP45-msTAdfseUcPIVX0SS4ejT1-XF2B_luIUE6VXsMGuS3H8DSPhjSJOGGsiluZx402_Z0BYp3hVYPxeAAMU0ijY_jHSqiS5TNzWVOU2pdDf4XaKCgb6RS5rpQsEnkH_QmFpPzOLPOtugVzF_Y5fAz5y3NHrjVH4B_EC1a0LlLRP2PNe4j_ayPjlsjDDo3V5vtPws9Awsjw3bAeJHma",
     content: "The original System-900 series utilizes fixed-size chunks of 256 tokens and 10% overlap. This legacy setting is now retired but documentation is kept for regulatory compliance. System-900 compliance rules dictate strict air-gapped deployments for public sector clients.",
-    chunks: []
-  }
+  },
 ];
-
-// Helper to generate a mock embedding vector if Gemini isn't configured
-function generateMockVector(text: string): number[] {
-  const hash = text.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-  const vector: number[] = [];
-  for (let i = 0; i < 64; i++) {
-    vector.push(Math.sin(hash + i) * 0.5 + 0.5);
-  }
-  return vector;
-}
-
-// Calculate Cosine Similarity between two vectors
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
 
 // Custom text chunking helper
 function chunkText(text: string, size: number, overlap: number, strategy: string): string[] {
@@ -218,38 +198,155 @@ function chunkText(text: string, size: number, overlap: number, strategy: string
   return chunks.filter(c => c.trim().length > 0);
 }
 
-// Initial chunk generation for seed data
-async function initializeSeedChunks() {
-  for (const doc of dataSources) {
-    if (doc.chunks.length === 0) {
+/**
+ * Load sources from DB into dataSources memory array.
+ * On first run (empty table) write the seed documents and embed their chunks.
+ */
+async function initializeSources() {
+  const existing = await countSources();
+  if (existing === 0) {
+    console.log("[sources] Empty DB — seeding initial documents...");
+    for (const doc of SEED_SOURCES) {
+      await upsertSource({ ...doc, ownerAvatar: doc.ownerAvatar ?? "" });
+      // Embed seed chunks
       const rawChunks = chunkText(doc.content, 120, 15, "Semantic");
-      doc.chunks = rawChunks.map((text, idx) => ({
-        id: `${doc.id}-chk-${idx}`,
-        sourceId: doc.id,
-        sourceName: doc.name,
-        text,
-        tokensCount: text.split(/\s+/).length,
-        embedding: generateMockVector(text)
-      }));
+      for (let idx = 0; idx < rawChunks.length; idx++) {
+        const text = rawChunks[idx];
+        try {
+          const embedding = await embedText(text);
+          await upsertChunk({ id: `${doc.id}-chk-${idx}`, sourceId: doc.id, sourceName: doc.name, text, tokensCount: text.split(/\s+/).length, embedding });
+        } catch (err) {
+          console.warn(`[seed] embed failed for ${doc.id}-chk-${idx}:`, err);
+        }
+      }
+      console.log(`[seed] Embedded: ${doc.name}`);
     }
   }
+  // Always load from DB into memory; cast status string → union literal
+  const rows = await loadSources();
+  dataSources = rows.map(r => ({
+    ...r,
+    status: r.status as SourceDoc["status"],
+    chunks: [],
+  }));
+  console.log(`[sources] Loaded ${dataSources.length} source(s) from DB`);
 }
-initializeSeedChunks();
 
 // Strategy Config State
 let strategyConfig = {
   chunkSize: 512,
   chunkOverlap: 15,
   separationStrategy: "Semantic",
-  vectorProvider: "Pinecone (Vector DB)",
-  apiEndpoint: "https://alpha-rag-8821.pinecone.io",
-  environment: ["us-east-1-aws", "gcp-starter"],
+  // Vector store — actual local pgvector config (read from env)
+  pgHost: process.env.PG_HOST || "127.0.0.1",
+  pgPort: process.env.PG_PORT || "5432",
+  pgDatabase: process.env.PG_DATABASE || "ai_hub",
+  pgTable: "marmot_chunks",
+  // Embedding model — Ollama local
+  embeddingProvider: "Ollama (Local)",
+  embeddingModel: "nomic-embed-text:latest",
+  embeddingDimension: 768,
+  ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+  // Auth
   ssoEnabled: true,
   providerList: [
-    { name: "OpenAI", active: true, model: "text-embedding-3-small", status: "Operational" },
-    { name: "Azure AI Search", active: false, model: "Vector Indexing", status: "Configured" }
-  ]
+    { name: "Ollama", active: true, model: "nomic-embed-text:latest", status: "Local" },
+    { name: "Gemini Generation", active: !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY", model: "gemini-3.5-flash", status: "Generation Only" }
+  ],
+  // Optional external / cloud vector DB — disabled by default
+  externalVectorDb: {
+    enabled: false,
+    provider: "Pinecone",
+    apiEndpoint: "",
+    apiKey: "",
+    indexName: "",
+    notes: "",
+  },
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipeline Store
+// ─────────────────────────────────────────────────────────────────────────────
+interface Pipeline {
+  id: string;
+  name: string;
+  description: string;
+  generationModel: string;
+  topK: number;
+  minScore: number;
+  systemPrompt: string;
+  sourceFilter: string[];
+  enabled: boolean;
+  createdAt: string;
+}
+
+const DEFAULT_SYSTEM_PROMPT = "You are an AI system that executes context-grounded RAG query answering and system evaluation, returning strictly compliant JSON.";
+
+let pipelines: Pipeline[] = [
+  {
+    id: "pipe-1",
+    name: "Doc-Search-Alpha",
+    description: "General-purpose document retrieval. Optimised for speed and broad coverage.",
+    generationModel: "gemini-3.5-flash",
+    topK: 3,
+    minScore: 0.0,
+    systemPrompt: "",
+    sourceFilter: [],
+    enabled: true,
+    createdAt: new Date(Date.now() - 86400000 * 7).toISOString(),
+  },
+  {
+    id: "pipe-2",
+    name: "Legal-Brief-Retriever",
+    description: "High-precision pipeline for legal and compliance documents. Filters low-confidence chunks.",
+    generationModel: "gemini-3.5-flash",
+    topK: 5,
+    minScore: 0.6,
+    systemPrompt: "You are a legal analyst. Answer with precise citations and conservative language.",
+    sourceFilter: [],
+    enabled: true,
+    createdAt: new Date(Date.now() - 86400000 * 3).toISOString(),
+  },
+  {
+    id: "pipe-3",
+    name: "Customer-Support-LLM",
+    description: "Customer-facing support assistant. Returns friendly, concise answers.",
+    generationModel: "gemini-3.5-flash",
+    topK: 3,
+    minScore: 0.3,
+    systemPrompt: "You are a helpful customer support agent. Be friendly, concise, and always suggest next steps.",
+    sourceFilter: [],
+    enabled: false,
+    createdAt: new Date(Date.now() - 86400000 * 1).toISOString(),
+  },
+];
+
+/** Compute live stats for all pipelines from the query log. */
+function computePipelineStats(): Record<string, {
+  queryCount: number; avgLatencyMs: number; avgFaithfulness: number; avgRelevance: number; lastUsed: string | null;
+}> {
+  const stats: Record<string, { count: number; latSum: number; faithSum: number; relSum: number; lastUsed: string | null }> = {};
+  for (const log of queryLogs) {
+    if (!stats[log.pipeline]) stats[log.pipeline] = { count: 0, latSum: 0, faithSum: 0, relSum: 0, lastUsed: null };
+    const s = stats[log.pipeline];
+    s.count++;
+    s.latSum += log.latencyMs;
+    s.faithSum += log.faithfulnessScore;
+    s.relSum += log.relevanceScore;
+    if (!s.lastUsed) s.lastUsed = log.timestamp;
+  }
+  const result: Record<string, { queryCount: number; avgLatencyMs: number; avgFaithfulness: number; avgRelevance: number; lastUsed: string | null }> = {};
+  for (const [name, s] of Object.entries(stats)) {
+    result[name] = {
+      queryCount: s.count,
+      avgLatencyMs: Math.round(s.latSum / s.count),
+      avgFaithfulness: Math.round(s.faithSum / s.count),
+      avgRelevance: Math.round(s.relSum / s.count),
+      lastUsed: s.lastUsed,
+    };
+  }
+  return result;
+}
 
 // System Query Logs State
 let queryLogs: QueryLog[] = [
@@ -306,9 +403,50 @@ let users = [
 
 // --- API Endpoints ---
 
-// Get health check
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", geminiActive: !!getAI() });
+// Parse a PDF file and return its extracted text
+// Body: { base64: string }  (raw base64 of the PDF file, no data-URI prefix needed)
+app.post("/api/parse-pdf", async (req, res) => {
+  const { base64 } = req.body;
+  if (!base64 || typeof base64 !== "string") {
+    res.status(400).json({ error: "base64 field is required." });
+    return;
+  }
+  try {
+    const buffer = Buffer.from(base64, "base64");
+    const data = await pdfParse(buffer);
+    // Strip null bytes and other control characters PostgreSQL rejects
+    const cleanText = data.text.replace(/\x00/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ").trim();
+    res.json({ text: cleanText, pages: data.numpages });
+  } catch (err) {
+    console.error("[parse-pdf] Failed to parse PDF:", err);
+    res.status(422).json({ error: "Failed to parse PDF. Make sure the file is a valid PDF." });
+  }
+});
+
+// Get health check — also probes pgvector and Ollama connectivity
+app.get("/api/health", async (req, res) => {
+  let pgConnected = false;
+  let ollamaConnected = false;
+
+  try {
+    await searchChunks(new Array(768).fill(0), 1);
+    pgConnected = true;
+  } catch { pgConnected = false; }
+
+  try {
+    const r = await fetch(`${process.env.OLLAMA_BASE_URL || "http://localhost:11434"}/api/tags`, { signal: AbortSignal.timeout(2000) });
+    ollamaConnected = r.ok;
+  } catch { ollamaConnected = false; }
+
+  res.json({
+    status: "ok",
+    geminiActive: !!getAI(),
+    pgConnected,
+    ollamaConnected,
+    pgHost: process.env.PG_HOST || "127.0.0.1",
+    pgDatabase: process.env.PG_DATABASE || "ai_hub",
+    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+  });
 });
 
 // Get data sources
@@ -316,7 +454,40 @@ app.get("/api/sources", (req, res) => {
   res.json(dataSources);
 });
 
-// Add a new document and chunk it in real-time
+/** Helper: embed all chunks for a doc, streaming SSE progress events. */
+async function embedAndStoreChunks(
+  docId: string,
+  docName: string,
+  rawChunks: string[],
+  send: (event: string, data: unknown) => void
+): Promise<Chunk[]> {
+  const chunksData: Chunk[] = [];
+  for (let i = 0; i < rawChunks.length; i++) {
+    const text = rawChunks[i];
+    let embedding: number[];
+    try {
+      embedding = await embedText(text);
+    } catch (err) {
+      throw new Error(`Ollama embed failed on chunk ${i}: ${err}`);
+    }
+    const chunk: Chunk = {
+      id: `${docId}-chk-${i}`,
+      sourceId: docId,
+      sourceName: docName,
+      text,
+      tokensCount: text.split(/\s+/).length,
+      embedding,
+    };
+    chunksData.push(chunk);
+    await upsertChunk(chunk as Required<Chunk>);
+    // Push progress event
+    send("progress", { done: i + 1, total: rawChunks.length });
+  }
+  return chunksData;
+}
+
+// Add a new document — SSE stream that emits progress while embedding
+// Event types: "start" | "progress" | "done" | "error"
 app.post("/api/sources", async (req, res) => {
   const { name, content, type } = req.body;
   if (!name || !content) {
@@ -324,8 +495,25 @@ app.post("/api/sources", async (req, res) => {
     return;
   }
 
+  // Reject duplicate: same name already exists in dataSources
+  const existing = dataSources.find(d => d.name.trim().toLowerCase() === name.trim().toLowerCase());
+  if (existing) {
+    res.status(409).json({ error: `A document named "${name}" already exists. Delete it first or use Re-index to update it.` });
+    return;
+  }
+
+  // Set up SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (event: string, data: unknown) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
   const id = `src-${Date.now()}`;
-  const docChunks = chunkText(
+  const rawChunks = chunkText(
     content,
     strategyConfig.chunkSize || 120,
     strategyConfig.chunkOverlap || 15,
@@ -336,124 +524,214 @@ app.post("/api/sources", async (req, res) => {
     id,
     name,
     type: type || "Text Document",
-    status: "Synced",
+    status: "Syncing...",
     lastSync: "Just now",
-    vectorsCount: docChunks.length,
+    vectorsCount: rawChunks.length,
     owner: "You",
     ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCUZfI40ZWgWIDJa9qAzScBenlksgTyw_ZjF1AYj9rj4vCTl6wZxKDgFBZpZlSBlYev_bfIafWaYRsnrWPZBoAc0ZbuwqbkwPXveoPjiO_YWKUF0Y4kefUnFCO6PdAN3kzoe6izqFyK2vK5zfYVlcZPQJdAgJshkBloQ6ERj6IhwjyffFbxRfbjqH03mzWd_9zHkPUEefX1dr6O20QnzW3vjN2U23n40Nt2nVNcnYrymJjWwbdsGeaa",
     content,
     chunks: []
   };
 
-  const ai = getAI();
-  const chunksData: Chunk[] = [];
+  // Persist to DB immediately (status: Syncing...)
+  await upsertSource({ id, name, type: newDoc.type, status: newDoc.status, lastSync: newDoc.lastSync, vectorsCount: newDoc.vectorsCount, owner: newDoc.owner, ownerAvatar: newDoc.ownerAvatar ?? "", content });
+  dataSources.unshift(newDoc);
+  send("start", { doc: { ...newDoc, chunks: [] }, total: rawChunks.length });
 
-  for (let i = 0; i < docChunks.length; i++) {
-    const text = docChunks[i];
-    let embedding: number[] | undefined = undefined;
-
-    // Call real Gemini Embedding if configured
-    if (ai) {
-      try {
-        const embedRes = await ai.models.embedContent({
-          model: "gemini-embedding-2-preview",
-          contents: text,
-        });
-        const resAny = embedRes as any;
-        const embObj = resAny.embedding || (Array.isArray(resAny.embeddings) ? resAny.embeddings[0] : resAny.embeddings);
-        if (embObj && embObj.values) {
-          embedding = embObj.values;
-        }
-      } catch (err) {
-        console.warn("Gemini embedding calculation failed, falling back to mock:", err);
-      }
-    }
-
-    if (!embedding) {
-      embedding = generateMockVector(text);
-    }
-
-    chunksData.push({
-      id: `${id}-chk-${i}`,
-      sourceId: id,
-      sourceName: name,
-      text,
-      tokensCount: text.split(/\s+/).length,
-      embedding
-    });
+  try {
+    const chunksData = await embedAndStoreChunks(id, name, rawChunks, send);
+    newDoc.chunks = chunksData;
+    newDoc.vectorsCount = chunksData.length;
+    newDoc.status = "Synced";
+    newDoc.lastSync = new Date().toLocaleTimeString("en-US", { hour12: false });
+    // Persist final state
+    await upsertSource({ id, name, type: newDoc.type, status: "Synced", lastSync: newDoc.lastSync, vectorsCount: newDoc.vectorsCount, owner: newDoc.owner, ownerAvatar: newDoc.ownerAvatar ?? "", content });
+    send("done", { doc: { ...newDoc, chunks: [] } });
+  } catch (err) {
+    newDoc.status = "Auth Error";
+    await upsertSource({ id, name, type: newDoc.type, status: "Auth Error", lastSync: newDoc.lastSync, vectorsCount: 0, owner: newDoc.owner, ownerAvatar: newDoc.ownerAvatar ?? "", content });
+    send("error", { message: String(err) });
   }
 
-  newDoc.chunks = chunksData;
-  newDoc.vectorsCount = chunksData.length;
-  dataSources.unshift(newDoc);
-
-  res.json(newDoc);
+  res.end();
 });
+
+// Delete a source document and its pgvector chunks
+app.delete("/api/sources/:id", async (req, res) => {
+  const { id } = req.params;
+  const idx = dataSources.findIndex(d => d.id === id);
+  if (idx === -1) { res.status(404).json({ error: "Source not found" }); return; }
+  dataSources.splice(idx, 1);
+  try {
+    await deleteChunksBySource(id);
+    await deleteSource(id);
+  } catch (err) {
+    console.warn("[delete-source] pgvector/source cleanup failed:", err);
+  }
+  res.json({ message: "Source deleted" });
+});
+
+// Re-index (re-chunk + re-embed) an existing source — SSE stream
+app.post("/api/sources/:id/reindex", async (req, res) => {
+  const { id } = req.params;
+  const doc = dataSources.find(d => d.id === id);
+  if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (event: string, data: unknown) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  doc.status = "Syncing...";
+  const rawChunks = chunkText(
+    doc.content,
+    strategyConfig.chunkSize || 120,
+    strategyConfig.chunkOverlap || 15,
+    strategyConfig.separationStrategy || "Semantic"
+  );
+
+  // Remove old chunks from pgvector
+  try {
+    await deleteChunksBySource(id);
+  } catch (err) {
+    console.warn("[reindex] pgvector cleanup failed:", err);
+  }
+
+  send("start", { doc: { ...doc, chunks: [] }, total: rawChunks.length });
+
+  try {
+    const chunksData = await embedAndStoreChunks(id, doc.name, rawChunks, send);
+    doc.chunks = chunksData;
+    doc.vectorsCount = chunksData.length;
+    doc.status = "Synced";
+    doc.lastSync = new Date().toLocaleTimeString("en-US", { hour12: false });
+    await upsertSource({ id, name: doc.name, type: doc.type, status: "Synced", lastSync: doc.lastSync, vectorsCount: doc.vectorsCount, owner: doc.owner, ownerAvatar: doc.ownerAvatar ?? "", content: doc.content });
+    send("done", { doc: { ...doc, chunks: [] } });
+  } catch (err) {
+    doc.status = "Auth Error";
+    await upsertSource({ id, name: doc.name, type: doc.type, status: "Auth Error", lastSync: doc.lastSync, vectorsCount: doc.vectorsCount, owner: doc.owner, ownerAvatar: doc.ownerAvatar ?? "", content: doc.content });
+    send("error", { message: String(err) });
+  }
+
+  res.end();
+});
+
+// ─── Pipeline CRUD ────────────────────────────────────────────────────────────
+
+app.get("/api/pipelines", (req, res) => {
+  const stats = computePipelineStats();
+  const result = pipelines.map(p => ({
+    ...p,
+    stats: stats[p.name] ?? { queryCount: 0, avgLatencyMs: 0, avgFaithfulness: 0, avgRelevance: 0, lastUsed: null },
+  }));
+  res.json(result);
+});
+
+app.post("/api/pipelines", (req, res) => {
+  const { name, description, generationModel, topK, minScore, systemPrompt, sourceFilter, enabled } = req.body;
+  if (!name) { res.status(400).json({ error: "name is required" }); return; }
+  const exists = pipelines.find(p => p.name === name);
+  if (exists) { res.status(409).json({ error: "Pipeline name already exists" }); return; }
+  const p: Pipeline = {
+    id: `pipe-${Date.now()}`,
+    name,
+    description: description || "",
+    generationModel: generationModel || "gemini-3.5-flash",
+    topK: topK ?? 3,
+    minScore: minScore ?? 0.0,
+    systemPrompt: systemPrompt || "",
+    sourceFilter: sourceFilter || [],
+    enabled: enabled ?? true,
+    createdAt: new Date().toISOString(),
+  };
+  pipelines.push(p);
+  res.status(201).json(p);
+});
+
+app.put("/api/pipelines/:id", (req, res) => {
+  const idx = pipelines.findIndex(p => p.id === req.params.id);
+  if (idx === -1) { res.status(404).json({ error: "Pipeline not found" }); return; }
+  // Prevent renaming to an existing name
+  if (req.body.name && req.body.name !== pipelines[idx].name) {
+    const clash = pipelines.find(p => p.name === req.body.name);
+    if (clash) { res.status(409).json({ error: "Pipeline name already exists" }); return; }
+  }
+  pipelines[idx] = { ...pipelines[idx], ...req.body, id: pipelines[idx].id, createdAt: pipelines[idx].createdAt };
+  res.json(pipelines[idx]);
+});
+
+app.delete("/api/pipelines/:id", (req, res) => {
+  const idx = pipelines.findIndex(p => p.id === req.params.id);
+  if (idx === -1) { res.status(404).json({ error: "Pipeline not found" }); return; }
+  pipelines.splice(idx, 1);
+  res.json({ message: "Pipeline deleted" });
+});
+
+// ─── RAG Query (uses pipeline config) ────────────────────────────────────────
 
 // Perform RAG Search & Context-Grounded Query Answering
 app.post("/api/query", async (req, res) => {
-  const { query, pipeline } = req.body;
+  const { query, pipeline: pipelineName } = req.body;
   if (!query) {
     res.status(400).json({ error: "Query is required" });
     return;
   }
 
+  // Resolve pipeline config — fall back to sensible defaults
+  const pipelineCfg: Pipeline = pipelines.find(p => p.name === pipelineName && p.enabled)
+    ?? pipelines.find(p => p.enabled)
+    ?? { id: "default", name: pipelineName || "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
+
   const startTime = Date.now();
-  let queryEmbedding: number[] | undefined = undefined;
 
-  const ai = getAI();
-
-  // Call real Gemini Embedding for the Query
-  if (ai) {
-    try {
-      const embedRes = await ai.models.embedContent({
-        model: "gemini-embedding-2-preview",
-        contents: query,
-      });
-      const resAny = embedRes as any;
-      const embObj = resAny.embedding || (Array.isArray(resAny.embeddings) ? resAny.embeddings[0] : resAny.embeddings);
-      if (embObj && embObj.values) {
-        queryEmbedding = embObj.values;
-      }
-    } catch (err) {
-      console.warn("Failed query embedding via Gemini, falling back:", err);
-    }
+  // Embed the query via Ollama
+  let queryEmbedding: number[];
+  try {
+    queryEmbedding = await embedText(query);
+  } catch (err) {
+    console.error("[query] Ollama embed failed:", err);
+    res.status(500).json({ error: "Embedding failed. Is Ollama running with nomic-embed-text?" });
+    return;
   }
 
-  if (!queryEmbedding) {
-    queryEmbedding = generateMockVector(query);
-  }
+  // Determine sources to exclude
+  const excludedIds = dataSources
+    .filter(d => d.status === "Paused" || d.status === "Auth Error")
+    .map(d => d.id);
 
-  // Calculate similarity against all chunks
-  const scoredChunks: { chunk: Chunk; similarity: number }[] = [];
-  for (const doc of dataSources) {
-    // Skip doc if paused or error (simulates realistic system state)
-    if (doc.status === "Paused" || doc.status === "Auth Error") continue;
+  // Apply pipeline sourceFilter (only search specified sources if set)
+  const activeSourceIds = pipelineCfg.sourceFilter.length > 0
+    ? dataSources.filter(d => pipelineCfg.sourceFilter.includes(d.id) && d.status === "Synced").map(d => d.id)
+    : null;
 
-    for (const chunk of doc.chunks) {
-      if (chunk.embedding) {
-        const score = cosineSimilarity(queryEmbedding, chunk.embedding);
-        scoredChunks.push({ chunk, similarity: score });
-      }
-    }
-  }
+  // Vector search using pipeline topK; post-filter by minScore
+  const pgResults = await searchChunks(queryEmbedding, pipelineCfg.topK * 2, excludedIds);
+  const filtered = pgResults.filter(r =>
+    r.score >= pipelineCfg.minScore &&
+    (activeSourceIds === null || activeSourceIds.includes(r.sourceId))
+  ).slice(0, pipelineCfg.topK);
 
-  // Sort by similarity and get top 3 context chunks
-  scoredChunks.sort((a, b) => b.similarity - a.similarity);
-  const topResults = scoredChunks.slice(0, 3);
+  const topResults = filtered.map(r => ({
+    chunk: { id: r.id, sourceId: r.sourceId, sourceName: r.sourceName, text: r.text, tokensCount: r.tokensCount } as Chunk,
+    similarity: r.score,
+  }));
 
-  // If no chunks matched or database is empty, return empty context
   const retrievedContext = topResults
     .map((res, i) => `[Document ${i + 1}: ${res.chunk.sourceName}] \n${res.chunk.text}`)
     .join("\n\n");
 
+  const ai = getAI();
   let ragAnswer = "";
   let faithfulnessScore = 90;
   let relevanceScore = 85;
 
   if (ai) {
     try {
-      // Prompt Gemini to answer based ONLY on the retrieved chunks
+      const sysInstruction = pipelineCfg.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
       const userPrompt = `
 You are a highly analytical RAG Retrieval QA System.
 Below is the User's Query and the Retrieved Context Chunks from the document database.
@@ -466,89 +744,63 @@ ${retrievedContext || "NO RELEVANT CONTEXT FOUND"}
 
 INSTRUCTIONS:
 1. Answer the query truthfully based ONLY on the retrieved context chunks.
-2. Cite your sources using bracketed notations like [Q3 Financial Reports], [Customer Support Docs], or [Enterprise Network Topology].
+2. Cite your sources using bracketed notations like [Source Name].
 3. Ensure absolute accuracy. Do not make up facts.
-4. If any retrieved context chunk contains an HTML <img> tag (e.g. <img src="..." alt="..." />) or markdown image tag, you MUST preserve it and include it inside your generated 'answer' at the exact logical point where it explains the context. Do not omit the 'src' or 'alt' attributes.
-5. Evaluate yourself and provide:
-   - "faithfulnessScore" (0-100): How strictly supported the answer is by the context.
-   - "relevanceScore" (0-100): How well the context matched the query intent.
+4. If any retrieved context chunk contains an HTML <img> tag, preserve it in your answer.
+5. Evaluate yourself and provide faithfulnessScore (0-100) and relevanceScore (0-100).
 
-Format your exact response as a strict JSON structure:
-{
-  "answer": "your fully formatted context-grounded answer here (which can contain paragraphs, HTML <img> tags, and list items)",
-  "faithfulnessScore": 95,
-  "relevanceScore": 90
-}
+Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceScore": 90 }
 `;
-
       const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: pipelineCfg.generationModel,
         contents: userPrompt,
         config: {
-          systemInstruction: "You are an AI system that executes context-grounded RAG query answering and system evaluation, returning strictly compliant JSON.",
+          systemInstruction: sysInstruction,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
-            properties: {
-              answer: { type: Type.STRING },
-              faithfulnessScore: { type: Type.INTEGER },
-              relevanceScore: { type: Type.INTEGER }
-            },
-            required: ["answer", "faithfulnessScore", "relevanceScore"]
-          }
-        }
+            properties: { answer: { type: Type.STRING }, faithfulnessScore: { type: Type.INTEGER }, relevanceScore: { type: Type.INTEGER } },
+            required: ["answer", "faithfulnessScore", "relevanceScore"],
+          },
+        },
       });
-
-      const responseText = response.text;
-      if (responseText) {
-        const parsed = JSON.parse(responseText.trim());
+      if (response.text) {
+        const parsed = JSON.parse(response.text.trim());
         ragAnswer = parsed.answer;
         faithfulnessScore = parsed.faithfulnessScore;
         relevanceScore = parsed.relevanceScore;
       }
     } catch (err) {
-      console.error("Gemini context answer generation failed:", err);
-      ragAnswer = `Failed to generate response using Gemini. Here is the context retrieved: \n\n${retrievedContext || "No context found."}`;
+      console.error("Gemini generation failed:", err);
+      ragAnswer = `Failed to generate response using Gemini. Retrieved context:\n\n${retrievedContext || "No context found."}`;
     }
   }
 
-  // Fallback if Gemini key is missing or failed completely
   if (!ragAnswer) {
     if (topResults.length > 0) {
-      // Check if top result contains image, if so, preserve it!
-      const topText = topResults[0].chunk.text;
-      ragAnswer = `[Offline Mode Response] Based on the context found in "${topResults[0].chunk.sourceName}": \n\n${topText}\n\n(Configure your GEMINI_API_KEY in Settings > Secrets for full AI reasoning and generation capabilities!)`;
-      faithfulnessScore = 95;
-      relevanceScore = 80;
+      ragAnswer = `[Offline Mode] Based on "${topResults[0].chunk.sourceName}":\n\n${topResults[0].chunk.text}\n\n(Configure GEMINI_API_KEY for full AI generation.)`;
+      faithfulnessScore = 95; relevanceScore = 80;
     } else {
-      ragAnswer = "No context was found matching your query in the active vector database. Please upload or activate documents in the Knowledge Base first.";
-      faithfulnessScore = 100;
-      relevanceScore = 10;
+      ragAnswer = "No context found matching your query. Please upload documents in the Knowledge Base first.";
+      faithfulnessScore = 100; relevanceScore = 10;
     }
   }
 
   const latencyMs = Date.now() - startTime;
-  const status = faithfulnessScore > 85 ? "success" : "warning";
-
   const newLog: QueryLog = {
     id: `log-${Date.now()}`,
     timestamp: new Date().toLocaleTimeString("en-US", { hour12: false }),
     query,
-    pipeline: pipeline || "Default-Pipeline",
+    pipeline: pipelineCfg.name,
     answer: ragAnswer,
     faithfulnessScore,
     relevanceScore,
     latencyMs,
-    status,
-    retrievedChunks: topResults.map(res => ({
-      text: res.chunk.text,
-      sourceName: res.chunk.sourceName,
-      score: Math.round(res.similarity * 100) / 100
-    }))
+    status: faithfulnessScore > 85 ? "success" : "warning",
+    retrievedChunks: topResults.map(r => ({ text: r.chunk.text, sourceName: r.chunk.sourceName, score: Math.round(r.similarity * 100) / 100 })),
   };
 
   queryLogs.unshift(newLog);
-
   res.json(newLog);
 });
 
@@ -621,6 +873,10 @@ app.post("/api/test-connectivity", (req, res) => {
 
 // --- Vite setup or production static server ---
 async function startServer() {
+  // Initialise pgvector tables, then load/seed sources from DB
+  await initDb();
+  await initializeSources();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

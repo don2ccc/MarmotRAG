@@ -1,44 +1,48 @@
 import React, { useState, useEffect } from "react";
-import { 
-  Database, 
-  Sliders, 
-  Shield, 
-  LayoutDashboard, 
-  Users, 
-  Plus, 
-  HelpCircle, 
-  Settings, 
-  Search, 
-  Bell, 
-  Grid, 
-  ArrowRight, 
-  MoreVertical, 
-  Key, 
-  Network, 
-  AlertTriangle, 
-  ChevronRight, 
-  TrendingUp, 
-  CheckCircle, 
-  AlignLeft, 
-  FileText, 
-  RefreshCw, 
-  Layers, 
-  Server, 
-  ChevronLeft, 
-  Filter, 
-  Play, 
-  UserPlus, 
-  Trash2, 
-  Info, 
-  Clock, 
-  TrendingDown, 
+import {
+  Database,
+  Sliders,
+  Shield,
+  LayoutDashboard,
+  Users,
+  Plus,
+  HelpCircle,
+  Settings,
+  Search,
+  Bell,
+  Grid,
+  ArrowRight,
+  MoreVertical,
+  Key,
+  Network,
+  AlertTriangle,
+  ChevronRight,
+  TrendingUp,
+  CheckCircle,
+  AlignLeft,
+  FileText,
+  RefreshCw,
+  Layers,
+  Server,
+  ChevronLeft,
+  Filter,
+  Play,
+  UserPlus,
+  Trash2,
+  Info,
+  Clock,
+  TrendingDown,
   Flame,
   Award,
   Sun,
-  Moon
+  Moon,
+  Pencil,
+  X,
+  ToggleLeft,
+  ToggleRight
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { SourceDoc, QueryLog, StrategyConfig, TabType } from "./types";
+import { SourceDoc, QueryLog, StrategyConfig, TabType, IndexingProgress, Pipeline, PipelineStats } from "./types";
 
 // Custom RAG Response Renderer that beautifully supports HTML hotlinked images & formatting
 function SafeRAGResponseRenderer({ text, isDark = true }: { text: string; isDark?: boolean }) {
@@ -130,6 +134,8 @@ function SafeRAGResponseRenderer({ text, isDark = true }: { text: string; isDark
   return <div className="space-y-2">{renderedElements}</div>;
 }
 
+type PipelineWithStats = Pipeline & { stats: PipelineStats & { pipelineId?: string } };
+
 export default function App() {
   const [themeMode, setThemeMode] = useState<"light" | "dark">("light");
   const [activeTab, setActiveTab] = useState<TabType>("dashboard");
@@ -137,6 +143,14 @@ export default function App() {
   const [logs, setLogs] = useState<QueryLog[]>([]);
   const [config, setConfig] = useState<StrategyConfig | null>(null);
   const [users, setUsers] = useState<any[]>([]);
+  const [healthStatus, setHealthStatus] = useState<{ pgConnected?: boolean; ollamaConnected?: boolean; geminiActive?: boolean; pgHost?: string; pgDatabase?: string; ollamaBaseUrl?: string } | null>(null);
+  const [pipelines, setPipelines] = useState<PipelineWithStats[]>([]);
+
+  // Pipeline editor state
+  const [isPipelineDrawerOpen, setIsPipelineDrawerOpen] = useState(false);
+  const [editingPipeline, setEditingPipeline] = useState<PipelineWithStats | null>(null);
+  const [pipelineForm, setPipelineForm] = useState<Partial<Pipeline>>({});
+  const [pipelineSaving, setPipelineSaving] = useState(false);
   
   // App UI state
   const [searchQuery, setSearchQuery] = useState("");
@@ -149,6 +163,10 @@ export default function App() {
   const [newDocName, setNewDocName] = useState("");
   const [newDocType, setNewDocType] = useState("PDF Collection");
   const [newDocContent, setNewDocContent] = useState("");
+  const [isPdfParsing, setIsPdfParsing] = useState(false);
+  const [pdfPageCount, setPdfPageCount] = useState<number | null>(null);
+  // Per-document live indexing progress: { [docId]: IndexingProgress }
+  const [indexingProgress, setIndexingProgress] = useState<Record<string, IndexingProgress>>({});
 
   // Add User state
   const [isAddUserOpen, setIsAddUserOpen] = useState(false);
@@ -172,25 +190,37 @@ export default function App() {
   // Load All Initial Data
   const loadData = async () => {
     try {
-      const [resSources, resLogs, resConfig, resUsers] = await Promise.all([
+      const [resSources, resLogs, resConfig, resUsers, resHealth, resPipelines] = await Promise.all([
         fetch("/api/sources").then(r => r.json()),
         fetch("/api/logs").then(r => r.json()),
         fetch("/api/config").then(r => r.json()),
-        fetch("/api/users").then(r => r.json())
+        fetch("/api/users").then(r => r.json()),
+        fetch("/api/health").then(r => r.json()),
+        fetch("/api/pipelines").then(r => r.json()),
       ]);
       setSources(resSources);
       setLogs(resLogs);
       setConfig(resConfig);
       setPendingConfig(resConfig);
       setUsers(resUsers);
+      setHealthStatus(resHealth);
+      setPipelines(resPipelines);
     } catch (err) {
       console.error("Error loading API data:", err);
       showToast("Error connecting to server. Make sure dev server is running.", "error");
     }
   };
 
+  const refreshPipelines = () =>
+    fetch("/api/pipelines").then(r => r.json()).then(setPipelines).catch(() => {});
+
   useEffect(() => {
     loadData();
+    const timer = setInterval(() => {
+      fetch("/api/health").then(r => r.json()).then(setHealthStatus).catch(() => {});
+      refreshPipelines();
+    }, 30000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -210,7 +240,70 @@ export default function App() {
     }, 4000);
   };
 
-  // Add a document (Upload & Chunk)
+  /** Subscribe to a /api/sources SSE stream, updating sources list in real-time. */
+  const subscribeToIndexSSE = (url: string, body: object, onStart?: () => void) => {
+    return new Promise<void>((resolve, reject) => {
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(async (res) => {
+        if (!res.ok) {
+          // Non-SSE error response (e.g. 409 duplicate name) — parse JSON message
+          const errBody = await res.json().catch(() => ({}));
+          reject(new Error(errBody.error || `Request failed (${res.status})`));
+          return;
+        }
+        if (!res.body) { reject(new Error("SSE request failed")); return; }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let docId = "";
+
+        const processChunk = (text: string) => {
+          buffer += text;
+          const messages = buffer.split("\n\n");
+          buffer = messages.pop() ?? "";
+          for (const msg of messages) {
+            if (!msg.trim()) continue;
+            const eventMatch = msg.match(/^event: (\w+)/m);
+            const dataMatch = msg.match(/^data: (.+)/m);
+            if (!eventMatch || !dataMatch) continue;
+            const event = eventMatch[1];
+            const data = JSON.parse(dataMatch[1]);
+
+            if (event === "start") {
+              docId = data.doc.id;
+              setSources(prev => {
+                if (prev.find(s => s.id === docId)) return prev.map(s => s.id === docId ? { ...s, ...data.doc } : s);
+                return [data.doc, ...prev];
+              });
+              setIndexingProgress(p => ({ ...p, [docId]: { done: 0, total: data.total } }));
+              onStart?.();
+            } else if (event === "progress") {
+              setIndexingProgress(p => ({ ...p, [docId]: { done: data.done, total: data.total } }));
+            } else if (event === "done") {
+              setSources(prev => prev.map(s => s.id === docId ? { ...s, ...data.doc } : s));
+              setIndexingProgress(p => { const n = { ...p }; delete n[docId]; return n; });
+              resolve();
+            } else if (event === "error") {
+              setSources(prev => prev.map(s => s.id === docId ? { ...s, status: "Auth Error" } : s));
+              setIndexingProgress(p => { const n = { ...p }; delete n[docId]; return n; });
+              reject(new Error(data.message));
+            }
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          processChunk(decoder.decode(value, { stream: true }));
+        }
+      }).catch(reject);
+    });
+  };
+
+  // Add a document (Upload & Chunk) — streams progress via SSE
   const handleAddDocument = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newDocName.trim() || !newDocContent.trim()) {
@@ -219,35 +312,44 @@ export default function App() {
     }
 
     setIsLoading(true);
+    // Close form immediately — progress is visible in the table
+    setIsNewDocOpen(false);
+    setPdfPageCount(null);
+
     try {
-      const res = await fetch("/api/sources", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: newDocName,
-          content: newDocContent,
-          type: newDocType
-        })
+      await subscribeToIndexSSE("/api/sources", {
+        name: newDocName, content: newDocContent, type: newDocType
       });
-
-      if (!res.ok) throw new Error("Failed to index document");
-
-      const indexedDoc = await res.json();
-      setSources(prev => [indexedDoc, ...prev]);
-      showToast(`Document chunked and indexed successfully! Generated ${indexedDoc.vectorsCount} chunks.`, "success");
-      
-      // Reset inputs
+      showToast(`Document indexed successfully!`, "success");
       setNewDocName("");
       setNewDocContent("");
-      setIsNewDocOpen(false);
-      
-      // Refresh logs because indexing triggers real-time chunks
-      loadData();
     } catch (err) {
       console.error(err);
-      showToast("Failed to chunk and index document.", "error");
+      showToast("Embedding failed. Is Ollama running?", "error");
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Re-index an existing document
+  const handleReindex = async (docId: string) => {
+    try {
+      setSources(prev => prev.map(s => s.id === docId ? { ...s, status: "Syncing..." } : s));
+      await subscribeToIndexSSE(`/api/sources/${docId}/reindex`, {});
+      showToast("Re-indexing complete!", "success");
+    } catch (err) {
+      showToast("Re-indexing failed. Is Ollama running?", "error");
+    }
+  };
+
+  // Delete a source document
+  const handleDeleteSource = async (docId: string) => {
+    try {
+      await fetch(`/api/sources/${docId}`, { method: "DELETE" });
+      setSources(prev => prev.filter(s => s.id !== docId));
+      showToast("Document removed from knowledge base.", "info");
+    } catch (err) {
+      showToast("Failed to delete document.", "error");
     }
   };
 
@@ -326,6 +428,48 @@ export default function App() {
     setHasUnsavedConfig(false);
     showToast("Unsaved configuration changes discarded.", "info");
   };
+
+  // ─── Pipeline CRUD handlers ───────────────────────────────────────────────
+  const openNewPipeline = () => {
+    setEditingPipeline(null);
+    setPipelineForm({ name: "", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true });
+    setIsPipelineDrawerOpen(true);
+  };
+  const openEditPipeline = (p: PipelineWithStats) => {
+    setEditingPipeline(p);
+    setPipelineForm({ ...p });
+    setIsPipelineDrawerOpen(true);
+  };
+  const handleSavePipeline = async () => {
+    setPipelineSaving(true);
+    try {
+      const method = editingPipeline ? "PUT" : "POST";
+      const url = editingPipeline ? `/api/pipelines/${editingPipeline.id}` : "/api/pipelines";
+      const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(pipelineForm) });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
+      await refreshPipelines();
+      setIsPipelineDrawerOpen(false);
+      showToast(editingPipeline ? "Pipeline updated." : "Pipeline created.", "success");
+    } catch (err: any) {
+      showToast(err.message || "Failed to save pipeline.", "error");
+    } finally {
+      setPipelineSaving(false);
+    }
+  };
+  const handleDeletePipeline = async (id: string) => {
+    try {
+      await fetch(`/api/pipelines/${id}`, { method: "DELETE" });
+      await refreshPipelines();
+      showToast("Pipeline deleted.", "info");
+    } catch { showToast("Failed to delete pipeline.", "error"); }
+  };
+  const handleTogglePipelineEnabled = async (p: PipelineWithStats) => {
+    try {
+      await fetch(`/api/pipelines/${p.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !p.enabled }) });
+      await refreshPipelines();
+    } catch { showToast("Failed to toggle pipeline.", "error"); }
+  };
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Manage Users
   const handleAddUser = async (e: React.FormEvent) => {
@@ -728,98 +872,224 @@ export default function App() {
                   </section>
                 </div>
 
-                {/* Right: Vector Destination Configuration */}
+                {/* Right: Vector Store + Embedding Model */}
                 <div className="lg:col-span-5 flex flex-col gap-8">
+
+                  {/* pgvector Card */}
                   <section className="bg-[#080808] p-6 rounded soft-card flex flex-col gap-4 border border-white/10">
                     <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-2">
                       <div className="flex items-center gap-3">
                         <div className="w-8 h-8 rounded bg-white/5 flex items-center justify-center text-[#ccff00]">
-                          <Network className="w-5 h-5" />
+                          <Server className="w-5 h-5" />
                         </div>
-                        <h3 className="font-display text-sm font-bold uppercase tracking-wider text-white">Vector Destination</h3>
+                        <div>
+                          <h3 className="font-display text-sm font-bold uppercase tracking-wider text-white">Vector Store</h3>
+                          <p className="text-[10px] text-white/40 font-mono mt-0.5">PostgreSQL + pgvector (Local)</p>
+                        </div>
                       </div>
-                      <span className="flex items-center gap-1.5 text-[9px] font-mono uppercase font-bold text-[#ccff00] bg-[#ccff00]/5 px-2 py-0.5 rounded border border-[#ccff00]/25">
-                        <span className="w-1.5 h-1.5 rounded-full bg-[#ccff00] animate-pulse"></span>
-                        Connected
+                      <span className={`flex items-center gap-1.5 text-[9px] font-mono uppercase font-bold px-2 py-0.5 rounded border ${
+                        healthStatus?.pgConnected
+                          ? "text-[#ccff00] bg-[#ccff00]/5 border-[#ccff00]/25"
+                          : "text-red-400 bg-red-500/5 border-red-500/20"
+                      }`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${healthStatus?.pgConnected ? "bg-[#ccff00] animate-pulse" : "bg-red-400"}`}></span>
+                        {healthStatus?.pgConnected ? "Connected" : healthStatus === null ? "Checking…" : "Disconnected"}
                       </span>
                     </div>
 
-                    <div className="space-y-4">
-                      <div className="flex flex-col gap-1.5">
-                        <label className="text-xs font-bold text-white uppercase tracking-wider">Provider Vector Database</label>
-                        <select 
-                          value={pendingConfig?.vectorProvider || "Pinecone (Vector DB)"}
-                          onChange={(e) => handleConfigChange("vectorProvider", e.target.value)}
-                          className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-sans text-white focus:bg-black focus:ring-1 focus:ring-[#ccff00] outline-none"
-                        >
-                          <option>Pinecone (Vector DB)</option>
-                          <option>Weaviate (Self-Hosted)</option>
-                          <option>Milvus (Enterprise Cluster)</option>
-                          <option>Supabase pgvector</option>
-                        </select>
-                      </div>
-
-                      <div className="flex flex-col gap-1.5">
-                        <label className="text-xs font-bold text-white uppercase tracking-wider">API Endpoint</label>
-                        <input 
-                          type="text"
-                          value={pendingConfig?.apiEndpoint || "https://alpha-rag-8821.pinecone.io"}
-                          onChange={(e) => handleConfigChange("apiEndpoint", e.target.value)}
-                          className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-mono text-white focus:bg-black focus:ring-1 focus:ring-[#ccff00] outline-none"
-                        />
-                      </div>
-
-                      <div className="flex flex-col gap-1.5">
-                        <label className="text-xs font-bold text-white uppercase tracking-wider">Environment Regions</label>
-                        <div className="flex gap-2">
-                          <span className="px-3 py-1.5 bg-white/5 text-white/70 rounded font-mono text-[11px] border border-white/10">us-east-1-aws</span>
-                          <span className="px-3 py-1.5 bg-white/5 text-white/70 rounded font-mono text-[11px] border border-white/10">gcp-starter</span>
+                    <div className="space-y-3">
+                      {[
+                        { label: "Host", value: pendingConfig?.pgHost || "127.0.0.1" },
+                        { label: "Port", value: pendingConfig?.pgPort || "5432" },
+                        { label: "Database", value: pendingConfig?.pgDatabase || "ai_hub" },
+                        { label: "Table", value: pendingConfig?.pgTable || "marmot_chunks" },
+                      ].map(({ label, value }) => (
+                        <div key={label} className="flex items-center justify-between py-2 border-b border-white/5">
+                          <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">{label}</span>
+                          <span className="text-xs font-mono text-white font-semibold">{value}</span>
                         </div>
+                      ))}
+                      <div className="flex items-center justify-between py-2 border-b border-white/5">
+                        <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">Vector Dimensions</span>
+                        <span className="text-xs font-mono text-[#ccff00] font-bold">768-dim (nomic)</span>
                       </div>
+                      <div className="flex items-center justify-between py-2">
+                        <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">Index Type</span>
+                        <span className="text-xs font-mono text-white/70 font-semibold">IVFFlat · cosine ops</span>
+                      </div>
+                    </div>
 
-                      <div className="pt-4 border-t border-white/10">
-                        <button 
-                          onClick={handleTestConnectivity}
-                          disabled={testingConnection}
-                          className="w-full py-2.5 border border-dashed border-white/15 hover:border-[#ccff00] hover:text-[#ccff00] text-white/60 text-xs font-bold rounded transition-all flex items-center justify-center gap-2 cursor-pointer bg-white/5 hover:bg-white/10"
-                        >
-                          <RefreshCw className={`w-3.5 h-3.5 ${testingConnection ? "animate-spin" : ""}`} />
-                          {testingConnection ? "Testing Connection..." : "Test Connectivity"}
-                        </button>
-                      </div>
+                    <div className="pt-2 border-t border-white/10">
+                      <button
+                        onClick={handleTestConnectivity}
+                        disabled={testingConnection}
+                        className="w-full py-2.5 border border-dashed border-white/15 hover:border-[#ccff00] hover:text-[#ccff00] text-white/60 text-xs font-bold rounded transition-all flex items-center justify-center gap-2 cursor-pointer bg-white/5 hover:bg-white/10"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${testingConnection ? "animate-spin" : ""}`} />
+                        {testingConnection ? "Testing..." : "Test DB Connection"}
+                      </button>
                     </div>
                   </section>
 
-                  {/* Access Group Card */}
-                  <section className="bg-gradient-to-br from-[#080808] to-[#040404] text-[#eeefff] p-6 rounded border border-white/10 relative overflow-hidden">
-                    <div className="relative z-10">
-                      <h4 className="text-[10px] font-mono uppercase tracking-widest text-[#ccff00] mb-3 font-bold">Workspace Access Permissions</h4>
-                      <div className="flex items-center gap-4">
-                        <div className="flex -space-x-2">
-                          <img 
-                            className="w-8 h-8 rounded-full border-2 border-black object-cover" 
-                            src="https://lh3.googleusercontent.com/aida-public/AB6AXuCB2V1AmGB2QbpzGRmdTc18v779hBGHKc1XGY8-Tpe7PrKvpkCdqOFrI1pw_sIYLXkPDjNchTSKlost7smglEjdkzy6No1nert4fbpnFrDfRqiO_tMkpJjEO2PzT8is4UvqykK3WS4i6GkycezERUIXIsjY9nR8zSPs5WHArO3G94M59wruvEas2lEFdmYnexWRGf70prB2z0tEmcjgXK5JNiXGZnuRm5cC3Qb6W6L1LcdXplXa3wE9" 
-                            alt="avatar" 
-                            referrerPolicy="no-referrer"
-                          />
-                          <img 
-                            className="w-8 h-8 rounded-full border-2 border-black object-cover" 
-                            src="https://lh3.googleusercontent.com/aida-public/AB6AXuD9HiY5NXFEBD_jBLR73RLjTyaUuFkDAGR3xP45-msTAdfseUcPIVX0SS4ejT1-XF2B_luIUE6VXsMGuS3H8DSPhjSJOGGsiluZx402_Z0BYp3hVYPxeAAMU0ijY_jHSqiS5TNzWVOU2pdDf4XaKCgb6RS5rpQsEnkH_QmFpPzOLPOtugVzF_Y5fAz5y3NHrjVH4B_EC1a0LlLRP2PNe4j_ayPjlsjDDo3V5vtPws9Awsjw3bAeJHma" 
-                            alt="avatar" 
-                            referrerPolicy="no-referrer"
-                          />
-                          <div className="w-8 h-8 rounded-full border-2 border-black bg-white/10 flex items-center justify-center text-[10px] font-mono font-bold text-white">
-                            +12
-                          </div>
+                  {/* Ollama Embedding Model Card */}
+                  <section className="bg-[#080808] p-6 rounded soft-card flex flex-col gap-4 border border-white/10">
+                    <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-2">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded bg-white/5 flex items-center justify-center text-[#ccff00]">
+                          <Layers className="w-5 h-5" />
                         </div>
-                        <p className="text-xs leading-snug font-medium">
-                          This embedding logic is strictly enforced across <span className="underline font-bold">all 14 contributors</span> in Alpha-Team workspace.
-                        </p>
+                        <div>
+                          <h3 className="font-display text-sm font-bold uppercase tracking-wider text-white">Embedding Model</h3>
+                          <p className="text-[10px] text-white/40 font-mono mt-0.5">Ollama (Local Inference)</p>
+                        </div>
                       </div>
+                      <span className={`flex items-center gap-1.5 text-[9px] font-mono uppercase font-bold px-2 py-0.5 rounded border ${
+                        healthStatus?.ollamaConnected
+                          ? "text-[#ccff00] bg-[#ccff00]/5 border-[#ccff00]/25"
+                          : "text-red-400 bg-red-500/5 border-red-500/20"
+                      }`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${healthStatus?.ollamaConnected ? "bg-[#ccff00] animate-pulse" : "bg-red-400"}`}></span>
+                        {healthStatus?.ollamaConnected ? "Running" : healthStatus === null ? "Checking…" : "Offline"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-3">
+                      {[
+                        { label: "Provider", value: "Ollama (Local)" },
+                        { label: "Model", value: pendingConfig?.embeddingModel || "nomic-embed-text:latest" },
+                        { label: "Dimensions", value: `${pendingConfig?.embeddingDimension || 768}` },
+                        { label: "Base URL", value: pendingConfig?.ollamaBaseUrl || "http://localhost:11434" },
+                      ].map(({ label, value }) => (
+                        <div key={label} className="flex items-center justify-between py-2 border-b border-white/5">
+                          <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">{label}</span>
+                          <span className="text-xs font-mono text-white font-semibold truncate max-w-[180px] text-right">{value}</span>
+                        </div>
+                      ))}
+                      <div className="flex items-center justify-between py-2">
+                        <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">Generation Model</span>
+                        <span className={`text-xs font-mono font-bold ${healthStatus?.geminiActive ? "text-[#ccff00]" : "text-white/40"}`}>
+                          {healthStatus?.geminiActive ? "gemini-3.5-flash ✓" : "gemini (no key)"}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="p-3 bg-white/5 border border-white/10 rounded flex items-start gap-2">
+                      <Info className="w-4 h-4 text-[#ccff00] flex-shrink-0 mt-0.5" />
+                      <p className="text-[10px] text-white/50 leading-relaxed">
+                        To change the embedding model, update <span className="font-mono text-white/70">OLLAMA_BASE_URL</span> in your <span className="font-mono text-white/70">.env</span> file and restart the server. The vector dimension must remain <span className="font-mono text-[#ccff00]">768</span> to match existing stored embeddings.
+                      </p>
                     </div>
                   </section>
                 </div>
               </div>
+
+              {/* External / Cloud Vector DB — Optional Extension */}
+              <section className="bg-[#080808] p-6 rounded soft-card border border-white/10">
+                <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-6">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded bg-white/5 flex items-center justify-center text-white/40">
+                      <Network className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="font-display text-sm font-bold uppercase tracking-wider text-white">External Vector DB</h3>
+                      <p className="text-[10px] text-white/40 font-mono mt-0.5">Optional — Cloud / SaaS vector store integration (reserved interface)</p>
+                    </div>
+                  </div>
+                  {/* Enable toggle */}
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <span className="text-[10px] font-mono uppercase text-white/40 font-bold">
+                      {pendingConfig?.externalVectorDb?.enabled ? "Enabled" : "Disabled"}
+                    </span>
+                    <div className="relative">
+                      <input
+                        type="checkbox"
+                        checked={pendingConfig?.externalVectorDb?.enabled ?? false}
+                        onChange={(e) => handleConfigChange("externalVectorDb", { ...pendingConfig?.externalVectorDb, enabled: e.target.checked })}
+                        className="sr-only peer"
+                      />
+                      <div className="w-9 h-5 bg-white/10 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-black after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#ccff00]"></div>
+                    </div>
+                  </label>
+                </div>
+
+                <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 transition-opacity duration-200 ${pendingConfig?.externalVectorDb?.enabled ? "opacity-100" : "opacity-40 pointer-events-none"}`}>
+                  {/* Provider select */}
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Provider</label>
+                    <select
+                      value={pendingConfig?.externalVectorDb?.provider || "Pinecone"}
+                      onChange={(e) => handleConfigChange("externalVectorDb", { ...pendingConfig?.externalVectorDb, provider: e.target.value })}
+                      className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-sans text-white focus:ring-1 focus:ring-[#ccff00] outline-none"
+                    >
+                      <option>Pinecone</option>
+                      <option>Weaviate</option>
+                      <option>Qdrant</option>
+                      <option>Milvus</option>
+                      <option>Zilliz Cloud</option>
+                      <option>Supabase pgvector</option>
+                      <option>Azure AI Search</option>
+                      <option>Elasticsearch</option>
+                      <option>Custom</option>
+                    </select>
+                  </div>
+
+                  {/* API Endpoint */}
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">API Endpoint / Host</label>
+                    <input
+                      type="text"
+                      placeholder="https://your-index.pinecone.io"
+                      value={pendingConfig?.externalVectorDb?.apiEndpoint || ""}
+                      onChange={(e) => handleConfigChange("externalVectorDb", { ...pendingConfig?.externalVectorDb, apiEndpoint: e.target.value })}
+                      className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-mono text-white focus:ring-1 focus:ring-[#ccff00] outline-none placeholder-white/20"
+                    />
+                  </div>
+
+                  {/* Index / Collection Name */}
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Index / Collection Name</label>
+                    <input
+                      type="text"
+                      placeholder="marmot-rag-prod"
+                      value={pendingConfig?.externalVectorDb?.indexName || ""}
+                      onChange={(e) => handleConfigChange("externalVectorDb", { ...pendingConfig?.externalVectorDb, indexName: e.target.value })}
+                      className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-mono text-white focus:ring-1 focus:ring-[#ccff00] outline-none placeholder-white/20"
+                    />
+                  </div>
+
+                  {/* API Key */}
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">API Key / Token</label>
+                    <input
+                      type="password"
+                      placeholder="sk-••••••••••••••••"
+                      value={pendingConfig?.externalVectorDb?.apiKey || ""}
+                      onChange={(e) => handleConfigChange("externalVectorDb", { ...pendingConfig?.externalVectorDb, apiKey: e.target.value })}
+                      className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-mono text-white focus:ring-1 focus:ring-[#ccff00] outline-none placeholder-white/20"
+                    />
+                  </div>
+
+                  {/* Notes */}
+                  <div className="flex flex-col gap-1.5 md:col-span-2">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Notes</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Production cluster, us-east-1, dim=768"
+                      value={pendingConfig?.externalVectorDb?.notes || ""}
+                      onChange={(e) => handleConfigChange("externalVectorDb", { ...pendingConfig?.externalVectorDb, notes: e.target.value })}
+                      className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-sans text-white focus:ring-1 focus:ring-[#ccff00] outline-none placeholder-white/20"
+                    />
+                  </div>
+                </div>
+
+                {/* Status note */}
+                <div className="mt-5 p-3 bg-white/5 border border-white/10 rounded flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-[10px] text-white/50 leading-relaxed">
+                    This is a <span className="font-bold text-white/70">reserved configuration interface</span>. Toggling it on saves the credentials but does not yet switch the active vector store — the system continues using local pgvector. Future versions will support live routing between local and cloud backends.
+                  </p>
+                </div>
+              </section>
 
               {/* Floating Save Bar */}
               <AnimatePresence>
@@ -942,10 +1212,10 @@ export default function App() {
                     <div className="flex justify-between items-center border-b border-white/10 pb-3">
                       <h3 className="font-display text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2">
                         <FileText className="w-4 h-4 text-[#ccff00]" />
-                        Index &amp; Chunk New Document (Gemini Embedding)
+                        Index &amp; Chunk New Document (Ollama Embedding)
                       </h3>
-                      <button 
-                        onClick={() => setIsNewDocOpen(false)}
+                      <button
+                        onClick={() => { setIsNewDocOpen(false); setPdfPageCount(null); }}
                         className="text-xs font-bold text-white/40 hover:text-white cursor-pointer"
                       >
                         Cancel
@@ -956,7 +1226,7 @@ export default function App() {
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="flex flex-col gap-1.5">
                           <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Document Name</label>
-                          <input 
+                          <input
                             type="text"
                             placeholder="e.g. Employee Handbook Q4.md"
                             value={newDocName}
@@ -981,14 +1251,83 @@ export default function App() {
                         </div>
                       </div>
 
+                      {/* PDF Upload Zone */}
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Upload PDF File <span className="text-white/30">(optional — auto-extracts text)</span></label>
+                        <label className={`flex flex-col items-center justify-center gap-2 p-5 border-2 border-dashed rounded cursor-pointer transition-all
+                          ${isPdfParsing ? "border-[#ccff00]/40 bg-[#ccff00]/5" : "border-white/10 bg-black/40 hover:border-[#ccff00]/30 hover:bg-[#ccff00]/5"}`}>
+                          <input
+                            type="file"
+                            accept=".pdf,application/pdf"
+                            className="hidden"
+                            disabled={isPdfParsing}
+                            onChange={async (e) => {
+                              const file = e.target.files?.[0];
+                              if (!file) return;
+                              setIsPdfParsing(true);
+                              setPdfPageCount(null);
+                              try {
+                                // Read file as base64
+                                const base64 = await new Promise<string>((resolve, reject) => {
+                                  const reader = new FileReader();
+                                  reader.onload = () => {
+                                    const result = reader.result as string;
+                                    // Strip the data:application/pdf;base64, prefix
+                                    resolve(result.split(",")[1]);
+                                  };
+                                  reader.onerror = reject;
+                                  reader.readAsDataURL(file);
+                                });
+                                const res = await fetch("/api/parse-pdf", {
+                                  method: "POST",
+                                  headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({ base64 }),
+                                });
+                                if (!res.ok) throw new Error("PDF parse failed");
+                                const data = await res.json();
+                                setNewDocContent(data.text.trim());
+                                setPdfPageCount(data.pages);
+                                // Auto-fill document name from filename if empty
+                                if (!newDocName) setNewDocName(file.name.replace(/\.pdf$/i, ""));
+                                setNewDocType("PDF Collection");
+                                showToast(`PDF parsed: ${data.pages} pages, ${data.text.trim().split(/\s+/).length.toLocaleString()} words extracted.`, "success");
+                              } catch (err) {
+                                showToast("Failed to parse PDF. Is it a valid, non-scanned PDF?", "error");
+                              } finally {
+                                setIsPdfParsing(false);
+                                // Reset file input so same file can be re-uploaded
+                                e.target.value = "";
+                              }
+                            }}
+                          />
+                          {isPdfParsing ? (
+                            <div className="flex flex-col items-center gap-2 text-[#ccff00]">
+                              <RefreshCw className="w-6 h-6 animate-spin" />
+                              <span className="text-xs font-mono font-bold">Extracting PDF text...</span>
+                            </div>
+                          ) : pdfPageCount !== null ? (
+                            <div className="flex flex-col items-center gap-1 text-[#ccff00]">
+                              <CheckCircle className="w-6 h-6" />
+                              <span className="text-xs font-mono font-bold">{pdfPageCount} pages extracted — click to replace</span>
+                            </div>
+                          ) : (
+                            <div className="flex flex-col items-center gap-1 text-white/40">
+                              <FileText className="w-6 h-6" />
+                              <span className="text-xs font-mono">Click to upload a PDF file</span>
+                              <span className="text-[10px] text-white/25">Text-based PDFs only · max 50MB</span>
+                            </div>
+                          )}
+                        </label>
+                      </div>
+
                       <div className="flex flex-col gap-1.5">
                         <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Document Content Text</label>
                         <p className="text-[10px] text-white/40 mb-1 leading-relaxed">
                           This content will be divided into chunks of <span className="font-bold text-[#ccff00] font-mono">{pendingConfig?.chunkSize || 512} tokens</span> with <span className="font-bold text-[#ccff00] font-mono">{pendingConfig?.chunkOverlap || 15}% overlap</span> using the <span className="font-bold text-[#ccff00] font-mono">{pendingConfig?.separationStrategy || "Semantic"}</span> strategy, then mapped to actual embedding vectors.
                         </p>
-                        <textarea 
+                        <textarea
                           rows={6}
-                          placeholder="Paste or write the document text to chunk and index..."
+                          placeholder="Paste text here, or upload a PDF above to auto-fill..."
                           value={newDocContent}
                           onChange={(e) => setNewDocContent(e.target.value)}
                           className="p-3 bg-black/60 border border-white/10 rounded text-xs font-mono text-white focus:bg-black focus:ring-1 focus:ring-[#ccff00] outline-none"
@@ -996,17 +1335,17 @@ export default function App() {
                       </div>
 
                       <div className="flex justify-end gap-3">
-                        <button 
+                        <button
                           type="button"
-                          onClick={() => setIsNewDocOpen(false)}
+                          onClick={() => { setIsNewDocOpen(false); setPdfPageCount(null); }}
                           className="px-4 py-2 border border-white/10 text-white/60 font-semibold text-xs rounded hover:bg-white/5"
                         >
                           Cancel
                         </button>
-                        <button 
+                        <button
                           type="submit"
-                          disabled={isLoading}
-                          className="px-5 py-2 bg-[#ccff00] text-black font-bold text-xs rounded hover:opacity-90 flex items-center gap-1.5 transition-all uppercase tracking-wider cursor-pointer"
+                          disabled={isLoading || isPdfParsing}
+                          className="px-5 py-2 bg-[#ccff00] text-black font-bold text-xs rounded hover:opacity-90 flex items-center gap-1.5 transition-all uppercase tracking-wider cursor-pointer disabled:opacity-50"
                         >
                           {isLoading ? "Running Embedding & Chunking..." : "Index & Sync document"}
                         </button>
@@ -1028,18 +1367,23 @@ export default function App() {
                       <tr>
                         <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">SOURCE NAME</th>
                         <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">TYPE</th>
-                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">STATUS</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">STATUS / PROGRESS</th>
                         <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">LAST SYNC</th>
                         <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">VECTORS</th>
                         <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">OWNER</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest text-right">ACTIONS</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/10">
-                      {filteredSources.map((doc) => (
+                      {filteredSources.map((doc) => {
+                        const progress = indexingProgress[doc.id];
+                        const isIndexing = !!progress || doc.status === "Syncing...";
+                        const pct = progress ? Math.round((progress.done / progress.total) * 100) : 0;
+                        return (
                         <tr key={doc.id} className="hover:bg-white/[0.02] transition-colors group">
                           <td className="px-6 py-4">
                             <div className="flex items-center gap-3">
-                              <div className="w-8 h-8 rounded bg-white/5 flex items-center justify-center text-[#ccff00]">
+                              <div className={`w-8 h-8 rounded bg-white/5 flex items-center justify-center text-[#ccff00] ${isIndexing ? "animate-pulse" : ""}`}>
                                 <FileText className="w-4 h-4" />
                               </div>
                               <div>
@@ -1053,30 +1397,46 @@ export default function App() {
                               {doc.type}
                             </span>
                           </td>
-                          <td className="px-6 py-4">
-                            <div className={`flex items-center gap-1.5 text-xs font-mono font-semibold ${
-                              doc.status === "Synced" ? "text-[#ccff00]" :
-                              doc.status === "Syncing..." ? "text-amber-500 animate-pulse" :
-                              doc.status === "Paused" ? "text-white/40" : "text-red-500"
-                            }`}>
-                              <span className={`w-1.5 h-1.5 rounded-full ${
-                                doc.status === "Synced" ? "bg-[#ccff00]" :
-                                doc.status === "Syncing..." ? "bg-amber-500" :
-                                doc.status === "Paused" ? "bg-white/40" : "bg-red-500"
-                              }`}></span>
-                              {doc.status}
-                            </div>
+                          <td className="px-6 py-4 min-w-[160px]">
+                            {isIndexing && progress ? (
+                              <div className="flex flex-col gap-1.5">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] font-mono text-amber-400 font-bold">Embedding…</span>
+                                  <span className="text-[10px] font-mono text-amber-400 font-bold">{progress.done}/{progress.total}</span>
+                                </div>
+                                <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden">
+                                  <div
+                                    className="bg-amber-400 h-full rounded-full transition-all duration-300"
+                                    style={{ width: `${pct}%` }}
+                                  />
+                                </div>
+                                <span className="text-[9px] font-mono text-white/30">{pct}% complete</span>
+                              </div>
+                            ) : (
+                              <div className={`flex items-center gap-1.5 text-xs font-mono font-semibold ${
+                                doc.status === "Synced" ? "text-[#ccff00]" :
+                                doc.status === "Syncing..." ? "text-amber-500 animate-pulse" :
+                                doc.status === "Paused" ? "text-white/40" : "text-red-500"
+                              }`}>
+                                <span className={`w-1.5 h-1.5 rounded-full ${
+                                  doc.status === "Synced" ? "bg-[#ccff00]" :
+                                  doc.status === "Syncing..." ? "bg-amber-500" :
+                                  doc.status === "Paused" ? "bg-white/40" : "bg-red-500"
+                                }`}></span>
+                                {doc.status}
+                              </div>
+                            )}
                           </td>
                           <td className="px-6 py-4 text-xs text-white/60 font-mono">{doc.lastSync}</td>
                           <td className="px-6 py-4 text-xs font-mono text-[#ccff00] font-bold">{doc.vectorsCount.toLocaleString()}</td>
                           <td className="px-6 py-4">
                             <div className="flex items-center gap-2">
                               {doc.ownerAvatar ? (
-                                <img 
-                                  src={doc.ownerAvatar} 
-                                  alt="Owner Avatar" 
+                                <img
+                                  src={doc.ownerAvatar}
+                                  alt="Owner Avatar"
                                   referrerPolicy="no-referrer"
-                                  className="w-6 h-6 rounded-full object-cover border border-white/10" 
+                                  className="w-6 h-6 rounded-full object-cover border border-white/10"
                                 />
                               ) : (
                                 <div className="w-6 h-6 rounded-full bg-white/10 border border-white/10"></div>
@@ -1084,8 +1444,30 @@ export default function App() {
                               <span className="text-xs text-white/80 font-semibold">{doc.owner}</span>
                             </div>
                           </td>
+                          {/* Actions */}
+                          <td className="px-6 py-4 text-right">
+                            <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <button
+                                onClick={() => handleReindex(doc.id)}
+                                disabled={isIndexing}
+                                title="Re-chunk & Re-embed"
+                                className="p-1.5 rounded hover:bg-[#ccff00]/10 text-white/40 hover:text-[#ccff00] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                              >
+                                <RefreshCw className={`w-3.5 h-3.5 ${isIndexing ? "animate-spin" : ""}`} />
+                              </button>
+                              <button
+                                onClick={() => handleDeleteSource(doc.id)}
+                                disabled={isIndexing}
+                                title="Delete document"
+                                className="p-1.5 rounded hover:bg-red-500/10 text-white/40 hover:text-red-500 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1470,12 +1852,20 @@ export default function App() {
                 <div className="lg:col-span-2 bg-[#080808] rounded border border-white/10 overflow-hidden">
                   <div className="p-5 border-b border-white/10 flex justify-between items-center">
                     <h4 className="font-display text-xs font-bold uppercase tracking-wider text-white">Active User Pipelines</h4>
-                    <button 
-                      onClick={() => setActiveTab("playground")}
-                      className="text-xs text-[#ccff00] font-mono uppercase tracking-wider font-bold flex items-center gap-1 hover:underline cursor-pointer"
-                    >
-                      Run Test <ChevronRight className="w-4 h-4" />
-                    </button>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={openNewPipeline}
+                        className="text-xs text-[#ccff00] font-mono uppercase tracking-wider font-bold flex items-center gap-1 hover:underline cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> New
+                      </button>
+                      <button
+                        onClick={() => setActiveTab("playground")}
+                        className="text-xs text-white/40 font-mono uppercase tracking-wider font-bold flex items-center gap-1 hover:text-white cursor-pointer"
+                      >
+                        Run Test <ChevronRight className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-left">
@@ -1485,45 +1875,67 @@ export default function App() {
                           <th className="px-6 py-3 font-semibold">MODEL</th>
                           <th className="px-6 py-3 font-semibold">LATENCY</th>
                           <th className="px-6 py-3 font-semibold">FAITHFULNESS</th>
+                          <th className="px-6 py-3 font-semibold">ACTIONS</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-white/10 text-white">
-                        <tr className="hover:bg-white/[0.01] transition-colors">
-                          <td className="px-6 py-4 flex items-center gap-3">
-                            <span className="w-2 h-2 bg-[#ccff00] rounded-full animate-pulse"></span>
-                            <div>
-                              <p className="text-xs font-bold text-white">Doc-Search-Alpha</p>
-                              <p className="text-[10px] text-white/40 font-medium">Active online</p>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4"><span className="text-xs font-mono bg-white/10 px-2 py-0.5 rounded font-semibold text-white/80 border border-white/10">Gemini-3.5-Flash</span></td>
-                          <td className="px-6 py-4 text-xs font-mono font-semibold text-[#ccff00]">182ms</td>
-                          <td className="px-6 py-4 text-xs font-mono font-bold text-[#ccff00]">98.1%</td>
-                        </tr>
-                        <tr className="hover:bg-white/[0.01] transition-colors">
-                          <td className="px-6 py-4 flex items-center gap-3">
-                            <span className="w-2 h-2 bg-[#ccff00] rounded-full"></span>
-                            <div>
-                              <p className="text-xs font-bold text-white">Legal-Brief-Retriever</p>
-                              <p className="text-[10px] text-white/40 font-medium">Active online</p>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4"><span className="text-xs font-mono bg-white/10 px-2 py-0.5 rounded font-semibold text-white/80 border border-white/10">Gemini-1.5-Pro</span></td>
-                          <td className="px-6 py-4 text-xs font-mono font-semibold text-[#ccff00]">315ms</td>
-                          <td className="px-6 py-4 text-xs font-mono font-bold text-[#ccff00]">92.4%</td>
-                        </tr>
-                        <tr className="hover:bg-white/[0.01] transition-colors">
-                          <td className="px-6 py-4 flex items-center gap-3">
-                            <span className="w-2 h-2 bg-white/20 rounded-full"></span>
-                            <div>
-                              <p className="text-xs font-bold text-white/60">Customer-Support-LLM</p>
-                              <p className="text-[10px] text-white/40 font-medium">Evaluating backup fallback</p>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4"><span className="text-xs font-mono bg-white/10 px-2 py-0.5 rounded font-semibold text-white/40 border border-white/10">Gemini-3.5-Flash</span></td>
-                          <td className="px-6 py-4 text-xs font-mono font-semibold text-white/40">--</td>
-                          <td className="px-6 py-4 text-xs font-bold text-white/40">--</td>
-                        </tr>
+                        {pipelines.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="px-6 py-8 text-center text-xs text-white/30 font-mono">
+                              No pipelines configured. Click <span className="text-[#ccff00]">+ New</span> to create one.
+                            </td>
+                          </tr>
+                        ) : pipelines.map(p => {
+                          const hasStats = p.stats && p.stats.queryCount > 0;
+                          const latency = hasStats ? `${Math.round(p.stats.avgLatencyMs)}ms` : "--";
+                          const faith = hasStats ? `${(p.stats.avgFaithfulness * 100).toFixed(1)}%` : "--";
+                          const statColor = p.enabled ? "text-[#ccff00]" : "text-white/30";
+                          return (
+                            <tr key={p.id} className="hover:bg-white/[0.01] transition-colors">
+                              <td className="px-6 py-4">
+                                <div className="flex items-center gap-3">
+                                  <span className={`w-2 h-2 rounded-full flex-shrink-0 ${p.enabled ? "bg-[#ccff00] animate-pulse" : "bg-white/20"}`}></span>
+                                  <div>
+                                    <p className={`text-xs font-bold ${p.enabled ? "text-white" : "text-white/40"}`}>{p.name}</p>
+                                    <p className="text-[10px] text-white/40 font-medium truncate max-w-[160px]">{p.description || (p.enabled ? "Active" : "Disabled")}</p>
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="px-6 py-4">
+                                <span className={`text-xs font-mono bg-white/10 px-2 py-0.5 rounded font-semibold border border-white/10 ${p.enabled ? "text-white/80" : "text-white/30"}`}>
+                                  {p.generationModel}
+                                </span>
+                              </td>
+                              <td className={`px-6 py-4 text-xs font-mono font-semibold ${statColor}`}>{latency}</td>
+                              <td className={`px-6 py-4 text-xs font-mono font-bold ${statColor}`}>{faith}</td>
+                              <td className="px-6 py-4">
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    onClick={() => handleTogglePipelineEnabled(p)}
+                                    title={p.enabled ? "Disable pipeline" : "Enable pipeline"}
+                                    className="text-white/30 hover:text-[#ccff00] transition-colors cursor-pointer"
+                                  >
+                                    {p.enabled ? <ToggleRight className="w-4 h-4 text-[#ccff00]" /> : <ToggleLeft className="w-4 h-4" />}
+                                  </button>
+                                  <button
+                                    onClick={() => openEditPipeline(p)}
+                                    title="Edit pipeline"
+                                    className="text-white/30 hover:text-white transition-colors cursor-pointer"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeletePipeline(p.id)}
+                                    title="Delete pipeline"
+                                    className="text-white/30 hover:text-red-400 transition-colors cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -1665,9 +2077,12 @@ export default function App() {
                         onChange={(e) => setPlaygroundPipeline(e.target.value)}
                         className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-sans font-semibold text-white outline-none focus:bg-black focus:ring-1 focus:ring-[#ccff00] cursor-pointer"
                       >
-                        <option>Doc-Search-Alpha</option>
-                        <option>Legal-Brief-Retriever</option>
-                        <option>Customer-Support-LLM</option>
+                        {pipelines.filter(p => p.enabled).map(p => (
+                          <option key={p.id} value={p.name}>{p.name}</option>
+                        ))}
+                        {pipelines.filter(p => p.enabled).length === 0 && (
+                          <option disabled>No enabled pipelines</option>
+                        )}
                       </select>
                     </div>
                   </div>
@@ -1841,6 +2256,215 @@ export default function App() {
           <span className="text-[9px] font-mono font-bold uppercase">RAG</span>
         </button>
       </nav>
+
+      {/* ── Pipeline Editor Drawer ── */}
+      <AnimatePresence>
+        {isPipelineDrawerOpen && (
+          <>
+            {/* Backdrop */}
+            <motion.div
+              key="pipeline-backdrop"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsPipelineDrawerOpen(false)}
+              className="fixed inset-0 bg-black/70 z-40"
+            />
+            {/* Drawer */}
+            <motion.div
+              key="pipeline-drawer"
+              initial={{ x: "100%" }}
+              animate={{ x: 0 }}
+              exit={{ x: "100%" }}
+              transition={{ type: "tween", duration: 0.25 }}
+              className="fixed right-0 top-0 h-full w-full max-w-md bg-[#0a0a0a] border-l border-white/10 z-50 flex flex-col overflow-hidden"
+            >
+              {/* Drawer Header */}
+              <div className="flex items-center justify-between px-6 py-5 border-b border-white/10 shrink-0">
+                <div>
+                  <h2 className="font-display text-sm font-bold text-white uppercase tracking-wider">
+                    {editingPipeline ? "Edit Pipeline" : "New Pipeline"}
+                  </h2>
+                  <p className="text-[10px] text-white/40 font-mono mt-0.5">
+                    {editingPipeline ? `ID: ${editingPipeline.id}` : "Configure a named RAG pipeline"}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setIsPipelineDrawerOpen(false)}
+                  className="text-white/40 hover:text-white transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Drawer Form Body */}
+              <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+
+                {/* Name */}
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">Pipeline Name *</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Doc-Search-Alpha"
+                    value={pipelineForm.name ?? ""}
+                    onChange={e => setPipelineForm(f => ({ ...f, name: e.target.value }))}
+                    className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-semibold text-white outline-none focus:ring-1 focus:ring-[#ccff00]"
+                  />
+                </div>
+
+                {/* Description */}
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">Description</label>
+                  <input
+                    type="text"
+                    placeholder="Short description of this pipeline's purpose"
+                    value={pipelineForm.description ?? ""}
+                    onChange={e => setPipelineForm(f => ({ ...f, description: e.target.value }))}
+                    className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-semibold text-white outline-none focus:ring-1 focus:ring-[#ccff00]"
+                  />
+                </div>
+
+                {/* Generation Model */}
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">Generation Model</label>
+                  <select
+                    value={pipelineForm.generationModel ?? "gemini-3.5-flash"}
+                    onChange={e => setPipelineForm(f => ({ ...f, generationModel: e.target.value }))}
+                    className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-semibold text-white outline-none focus:ring-1 focus:ring-[#ccff00] cursor-pointer"
+                  >
+                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                    <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+                    <option value="offline">offline (retrieval only)</option>
+                  </select>
+                </div>
+
+                {/* Top-K */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">Top-K Chunks</label>
+                    <span className="text-xs font-mono font-bold text-[#ccff00]">{pipelineForm.topK ?? 3}</span>
+                  </div>
+                  <input
+                    type="range" min={1} max={10} step={1}
+                    value={pipelineForm.topK ?? 3}
+                    onChange={e => setPipelineForm(f => ({ ...f, topK: Number(e.target.value) }))}
+                    className="w-full accent-[#ccff00] cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[9px] font-mono text-white/20">
+                    <span>1 (precise)</span><span>10 (broad)</span>
+                  </div>
+                </div>
+
+                {/* Min Score */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">Min Similarity Score</label>
+                    <span className="text-xs font-mono font-bold text-[#ccff00]">{((pipelineForm.minScore ?? 0) * 100).toFixed(0)}%</span>
+                  </div>
+                  <input
+                    type="range" min={0} max={1} step={0.05}
+                    value={pipelineForm.minScore ?? 0}
+                    onChange={e => setPipelineForm(f => ({ ...f, minScore: Number(e.target.value) }))}
+                    className="w-full accent-[#ccff00] cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[9px] font-mono text-white/20">
+                    <span>0% (all chunks)</span><span>100% (exact match)</span>
+                  </div>
+                </div>
+
+                {/* System Prompt */}
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">System Prompt <span className="normal-case text-white/20">(leave blank for default)</span></label>
+                  <textarea
+                    rows={4}
+                    placeholder="You are a helpful assistant. Answer only using the provided context..."
+                    value={pipelineForm.systemPrompt ?? ""}
+                    onChange={e => setPipelineForm(f => ({ ...f, systemPrompt: e.target.value }))}
+                    className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-mono text-white/80 outline-none focus:ring-1 focus:ring-[#ccff00] resize-none"
+                  />
+                </div>
+
+                {/* Source Filter */}
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-mono uppercase tracking-wider text-white/50">Source Filter <span className="normal-case text-white/20">(leave blank = all sources)</span></label>
+                  <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                    {sources.length === 0 ? (
+                      <p className="text-[10px] text-white/20 font-mono">No indexed documents yet.</p>
+                    ) : sources.map(s => {
+                      const checked = (pipelineForm.sourceFilter ?? []).includes(s.id);
+                      return (
+                        <label key={s.id} className="flex items-center gap-2.5 cursor-pointer group">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              const current = pipelineForm.sourceFilter ?? [];
+                              setPipelineForm(f => ({
+                                ...f,
+                                sourceFilter: checked
+                                  ? current.filter(id => id !== s.id)
+                                  : [...current, s.id]
+                              }));
+                            }}
+                            className="accent-[#ccff00] cursor-pointer"
+                          />
+                          <span className="text-xs font-semibold text-white/60 group-hover:text-white transition-colors truncate">{s.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Enabled toggle */}
+                <div className="flex items-center justify-between py-3 border-t border-white/10">
+                  <div>
+                    <p className="text-xs font-bold text-white">Enabled</p>
+                    <p className="text-[10px] text-white/30 font-mono">Disabled pipelines are hidden from the playground</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPipelineForm(f => ({ ...f, enabled: !f.enabled }))}
+                    className="cursor-pointer"
+                  >
+                    {pipelineForm.enabled
+                      ? <ToggleRight className="w-8 h-8 text-[#ccff00]" />
+                      : <ToggleLeft className="w-8 h-8 text-white/30" />
+                    }
+                  </button>
+                </div>
+              </div>
+
+              {/* Drawer Footer */}
+              <div className="shrink-0 px-6 py-4 border-t border-white/10 flex items-center justify-between gap-3">
+                {editingPipeline && (
+                  <button
+                    onClick={() => { handleDeletePipeline(editingPipeline.id); setIsPipelineDrawerOpen(false); }}
+                    className="text-xs font-mono font-bold text-red-400 hover:text-red-300 flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" /> Delete
+                  </button>
+                )}
+                <div className="flex items-center gap-3 ml-auto">
+                  <button
+                    onClick={() => setIsPipelineDrawerOpen(false)}
+                    className="px-4 py-2 border border-white/10 rounded text-xs font-bold text-white/50 hover:text-white hover:border-white/30 transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSavePipeline}
+                    disabled={pipelineSaving || !pipelineForm.name?.trim()}
+                    className="px-5 py-2 bg-[#ccff00] text-black text-xs font-bold rounded hover:opacity-90 disabled:opacity-40 flex items-center gap-2 uppercase tracking-widest cursor-pointer transition-all"
+                  >
+                    {pipelineSaving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
+                    {pipelineSaving ? "Saving..." : editingPipeline ? "Update" : "Create"}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
