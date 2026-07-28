@@ -61,7 +61,23 @@ export interface StrategyConfig {
   };
 }
 
-export type TabType = "workspace" | "knowledge-base" | "admin" | "dashboard" | "playground";
+export type TabType = "workspace" | "knowledge-base" | "admin" | "dashboard" | "playground" | "api-access";
+
+/** An API Key issued to an external AI Agent / integration. */
+export interface AgentApiKey {
+  id: string;
+  label: string;             // human-readable name, e.g. "LangChain Bot - Prod"
+  key: string;               // the actual secret: "mrmk_<hex>" — shown once on creation
+  keyPreview: string;        // masked version: "mrmk_****...****ab12" — always shown
+  pipelineId: string | null; // null = caller may choose at query time
+  sourceFilter: string[];    // [] = all sources, otherwise restrict retrieval
+  rateLimit: number;         // max requests per minute (0 = unlimited)
+  enabled: boolean;
+  createdAt: string;
+  lastUsedAt: string | null;
+  usageCount: number;        // total calls served
+  usageThisMonth: number;    // calls in current calendar month
+}
 
 /** A named RAG pipeline configuration. */
 export interface Pipeline {

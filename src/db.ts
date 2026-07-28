@@ -46,6 +46,24 @@ export async function initDb(): Promise<void> {
   // Run each DDL statement with its own pool.query() call to avoid
   // the "client already executing" deprecation warning from pg-pool.
   await pool.query("CREATE EXTENSION IF NOT EXISTS vector");
+  // Migrate embedding dimension if the table already exists with a different size.
+  // Target: vector(2000) — pgvector ivfflat hard limit is 2000 dims.
+  // atttypmod for vector(n) in pgvector = n+8 (e.g. vector(2000) → atttypmod=2008)
+  const TARGET_TYPMOD = 2008; // vector(2000) = 2000 + 8
+  const dimCheck = await pool.query(`
+    SELECT atttypmod
+    FROM pg_attribute
+    JOIN pg_class ON pg_class.oid = pg_attribute.attrelid
+    WHERE pg_class.relname = 'marmot_chunks'
+      AND pg_attribute.attname = 'embedding'
+      AND pg_attribute.attnum > 0
+  `);
+  if (dimCheck.rows.length > 0 && dimCheck.rows[0].atttypmod !== TARGET_TYPMOD) {
+    console.log(`[db] Embedding dimension mismatch (typmod=${dimCheck.rows[0].atttypmod}, want ${TARGET_TYPMOD}), recreating marmot_chunks table...`);
+    await pool.query("DROP INDEX IF EXISTS marmot_chunks_embedding_idx");
+    await pool.query("DROP TABLE IF EXISTS marmot_chunks");
+  }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS marmot_chunks (
       id           TEXT PRIMARY KEY,
@@ -53,14 +71,14 @@ export async function initDb(): Promise<void> {
       source_name  TEXT NOT NULL,
       text         TEXT NOT NULL,
       tokens_count INTEGER NOT NULL DEFAULT 0,
-      embedding    vector(768)
+      embedding    vector(2000)
     )
   `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS marmot_chunks_embedding_idx
     ON marmot_chunks
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 10)
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS marmot_sources (
@@ -186,6 +204,12 @@ export async function loadSources(): Promise<PersistedSource[]> {
 /** Count how many source rows exist (used for seed guard). */
 export async function countSources(): Promise<number> {
   const { rows } = await getPool().query("SELECT COUNT(*)::int AS n FROM marmot_sources");
+  return rows[0].n;
+}
+
+/** Count total chunk rows (used to detect dimension migration requiring full reindex). */
+export async function countChunks(): Promise<number> {
+  const { rows } = await getPool().query("SELECT COUNT(*)::int AS n FROM marmot_chunks");
   return rows[0].n;
 }
 

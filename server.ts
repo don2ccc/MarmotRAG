@@ -3,12 +3,14 @@ import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { initDb, upsertChunk, searchChunks, deleteChunksBySource, upsertSource, loadSources, deleteSource, countSources } from "./src/db.js";
+import { initDb, upsertChunk, searchChunks, deleteChunksBySource, upsertSource, loadSources, deleteSource, countSources, countChunks } from "./src/db.js";
 import { embedText } from "./src/embeddings.js";
-// pdf-parse v1 is CJS; access the function via .default when loaded as ESM
+// CJS modules — loaded via createRequire (ESM project)
 import { createRequire } from "module";
 const _require = createRequire(import.meta.url);
 const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = _require("pdf-parse");
+// jieba-wasm: CJK-aware tokenizer (Rust/WASM, no native build needed)
+const jieba = _require("jieba-wasm") as { cut: (text: string, hmm: boolean) => string[] };
 
 dotenv.config();
 
@@ -135,43 +137,56 @@ const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
   },
 ];
 
-// Custom text chunking helper
+/**
+ * Count tokens in a text string using jieba for CJK content.
+ * jieba.cut returns individual words/chars; filter out pure-whitespace tokens.
+ * This gives accurate word counts for Chinese, Japanese, and mixed text.
+ */
+function countTokens(text: string): number {
+  return jieba.cut(text, false).filter(t => t.trim().length > 0).length;
+}
+
+/**
+ * Split text into chunks using jieba-aware token counting.
+ * - "Semantic": sentence-boundary sliding window (CJK + Latin punctuation)
+ * - "Fixed": sliding window by token count
+ * - "Paragraph": split on blank lines, fallback to Fixed for long paragraphs
+ *
+ * `size` = max tokens per chunk (jieba tokens, ~1 CJK word each)
+ * `overlap` = number of tokens to carry over between chunks
+ */
 function chunkText(text: string, size: number, overlap: number, strategy: string): string[] {
-  const words = text.split(/\s+/);
   const chunks: string[] = [];
-  
-  if (strategy === "Fixed" || words.length < size / 2) {
-    // Basic character or word-based sliding window
-    const stride = Math.max(1, Math.floor(size * (1 - overlap / 100)));
-    for (let i = 0; i < words.length; i += stride) {
-      const chunkWords = words.slice(i, i + size);
-      if (chunkWords.length > 0) {
-        chunks.push(chunkWords.join(" "));
-      }
-      if (i + size >= words.length) break;
+  const totalTokens = countTokens(text);
+
+  if (strategy === "Fixed" || totalTokens < size / 2) {
+    // Sliding window over jieba tokens
+    const tokens = jieba.cut(text, false).filter(t => t.trim().length > 0);
+    const stride = Math.max(1, size - overlap);
+    for (let i = 0; i < tokens.length; i += stride) {
+      const slice = tokens.slice(i, i + size);
+      if (slice.length > 0) chunks.push(slice.join(""));
+      if (i + size >= tokens.length) break;
     }
   } else if (strategy === "Semantic") {
-    // Semantic sentence-boundary sliding window (treats HTML tags as parts of sentences)
-    const sentences = text.match(/[^.!?]+[.!?]+(\s|$)/g) || [text];
+    // Split on CJK + Latin sentence boundaries
+    const sentences = text.match(/[^.!?。！？\n]+[.!?。！？\n]+/g) || [text];
     let currentChunk: string[] = [];
     let currentLen = 0;
-    
+
     for (const sentence of sentences) {
-      const sentenceLen = sentence.split(/\s+/).length;
+      const sentenceLen = countTokens(sentence);
       if (currentLen + sentenceLen > size && currentChunk.length > 0) {
-        chunks.push(currentChunk.join(" "));
-        // Apply overlap (retain last few sentences)
-        const overlapLimit = Math.max(1, Math.floor(size * (overlap / 100)));
+        chunks.push(currentChunk.join(""));
+        // Overlap: retain last `overlap` tokens worth of sentences
         let overlapLen = 0;
         const overlapChunk: string[] = [];
         for (let j = currentChunk.length - 1; j >= 0; j--) {
-          const wCount = currentChunk[j].split(/\s+/).length;
-          if (overlapLen + wCount <= overlapLimit) {
+          const wc = countTokens(currentChunk[j]);
+          if (overlapLen + wc <= overlap) {
             overlapChunk.unshift(currentChunk[j]);
-            overlapLen += wCount;
-          } else {
-            break;
-          }
+            overlapLen += wc;
+          } else break;
         }
         currentChunk = overlapChunk;
         currentLen = overlapLen;
@@ -179,19 +194,15 @@ function chunkText(text: string, size: number, overlap: number, strategy: string
       currentChunk.push(sentence.trim());
       currentLen += sentenceLen;
     }
-    if (currentChunk.length > 0) {
-      chunks.push(currentChunk.join(" "));
-    }
+    if (currentChunk.length > 0) chunks.push(currentChunk.join(""));
   } else {
-    // Recursive: Split by paragraphs first
+    // Paragraph strategy
     const paragraphs = text.split(/\n\s*\n+/);
     for (const para of paragraphs) {
-      if (para.split(/\s+/).length <= size) {
+      if (countTokens(para) <= size) {
         chunks.push(para.trim());
       } else {
-        // Fallback to fixed chunking for huge paragraphs
-        const subChunks = chunkText(para, size, overlap, "Fixed");
-        chunks.push(...subChunks);
+        chunks.push(...chunkText(para, size, overlap, "Fixed"));
       }
     }
   }
@@ -230,12 +241,25 @@ async function initializeSources() {
     chunks: [],
   }));
   console.log(`[sources] Loaded ${dataSources.length} source(s) from DB`);
+
+  // If marmot_chunks is empty but we have synced sources, the embedding model
+  // was changed (dimension migration). Mark those sources as needing reindex.
+  const chunkTotal = await countChunks();
+  if (chunkTotal === 0 && dataSources.length > 0) {
+    console.warn("[sources] marmot_chunks is empty — marking all sources as needing reindex");
+    for (const doc of dataSources) {
+      if (doc.status === "Synced") {
+        doc.status = "Paused";
+        await upsertSource({ id: doc.id, name: doc.name, type: doc.type, status: "Paused", lastSync: doc.lastSync, vectorsCount: 0, owner: doc.owner, ownerAvatar: doc.ownerAvatar ?? "", content: doc.content });
+      }
+    }
+  }
 }
 
 // Strategy Config State
 let strategyConfig = {
-  chunkSize: 512,
-  chunkOverlap: 15,
+  chunkSize: 200,   // 200 jieba-tokens — safe for qwen3-embedding (32k ctx window)
+  chunkOverlap: 20,
   separationStrategy: "Semantic",
   // Vector store — actual local pgvector config (read from env)
   pgHost: process.env.PG_HOST || "127.0.0.1",
@@ -244,13 +268,13 @@ let strategyConfig = {
   pgTable: "marmot_chunks",
   // Embedding model — Ollama local
   embeddingProvider: "Ollama (Local)",
-  embeddingModel: "nomic-embed-text:latest",
-  embeddingDimension: 768,
+  embeddingModel: "qwen3-embedding:4b",
+  embeddingDimension: 2000,
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
   // Auth
   ssoEnabled: true,
   providerList: [
-    { name: "Ollama", active: true, model: "nomic-embed-text:latest", status: "Local" },
+    { name: "Ollama", active: true, model: "qwen3-embedding:4b", status: "Local" },
     { name: "Gemini Generation", active: !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY", model: "gemini-3.5-flash", status: "Generation Only" }
   ],
   // Optional external / cloud vector DB — disabled by default
@@ -282,12 +306,67 @@ interface Pipeline {
 
 const DEFAULT_SYSTEM_PROMPT = "You are an AI system that executes context-grounded RAG query answering and system evaluation, returning strictly compliant JSON.";
 
+/**
+ * Generate a RAG answer using a local Ollama model.
+ * Model name is passed as the part after "ollama:" prefix (e.g. "ollama:bjoernb/gemma4-e4b-think:latest").
+ * Ollama's /api/chat endpoint is OpenAI-compatible.
+ * Returns { answer, faithfulnessScore, relevanceScore } — parses JSON from the response text.
+ */
+async function generateWithOllama(
+  modelName: string,
+  systemPrompt: string,
+  userPrompt: string
+): Promise<{ answer: string; faithfulnessScore: number; relevanceScore: number }> {
+  const ollamaBase = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+
+  const body = {
+    model: modelName,
+    stream: false,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user",   content: userPrompt },
+    ],
+    // Ask Ollama to return JSON — works with models that support it
+    format: "json",
+    options: { temperature: 0.1 },
+  };
+
+  const res = await fetch(`${ollamaBase}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000), // 2 min timeout for large models
+  });
+
+  if (!res.ok) {
+    throw new Error(`Ollama /api/chat failed: ${res.status} ${res.statusText}`);
+  }
+
+  const data = await res.json() as { message?: { content?: string } };
+  const raw = data.message?.content?.trim() ?? "";
+
+  // Strip markdown code fences if model wraps JSON in ```json ... ```
+  const jsonText = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+
+  try {
+    const parsed = JSON.parse(jsonText);
+    return {
+      answer: typeof parsed.answer === "string" ? parsed.answer : raw,
+      faithfulnessScore: typeof parsed.faithfulnessScore === "number" ? parsed.faithfulnessScore : 85,
+      relevanceScore: typeof parsed.relevanceScore === "number" ? parsed.relevanceScore : 80,
+    };
+  } catch {
+    // Model didn't return valid JSON — use the raw text as the answer
+    return { answer: raw || "No response generated.", faithfulnessScore: 80, relevanceScore: 75 };
+  }
+}
+
 let pipelines: Pipeline[] = [
   {
     id: "pipe-1",
     name: "Doc-Search-Alpha",
     description: "General-purpose document retrieval. Optimised for speed and broad coverage.",
-    generationModel: "gemini-3.5-flash",
+    generationModel: "ollama:bjoernb/gemma4-e4b-think:latest",
     topK: 3,
     minScore: 0.0,
     systemPrompt: "",
@@ -468,6 +547,7 @@ async function embedAndStoreChunks(
     try {
       embedding = await embedText(text);
     } catch (err) {
+      console.error(`[embed] chunk ${i} failed (${text.split(/\s+/).length} words): ${err}`);
       throw new Error(`Ollama embed failed on chunk ${i}: ${err}`);
     }
     const chunk: Chunk = {
@@ -694,7 +774,7 @@ app.post("/api/query", async (req, res) => {
     queryEmbedding = await embedText(query);
   } catch (err) {
     console.error("[query] Ollama embed failed:", err);
-    res.status(500).json({ error: "Embedding failed. Is Ollama running with nomic-embed-text?" });
+    res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
     return;
   }
 
@@ -729,11 +809,8 @@ app.post("/api/query", async (req, res) => {
   let faithfulnessScore = 90;
   let relevanceScore = 85;
 
-  if (ai) {
-    try {
-      const sysInstruction = pipelineCfg.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
-      const userPrompt = `
-You are a highly analytical RAG Retrieval QA System.
+  const sysInstruction = pipelineCfg.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
+  const userPrompt = `You are a highly analytical RAG Retrieval QA System.
 Below is the User's Query and the Retrieved Context Chunks from the document database.
 
 USER QUERY:
@@ -749,8 +826,26 @@ INSTRUCTIONS:
 4. If any retrieved context chunk contains an HTML <img> tag, preserve it in your answer.
 5. Evaluate yourself and provide faithfulnessScore (0-100) and relevanceScore (0-100).
 
-Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceScore": 90 }
-`;
+Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceScore": 90 }`;
+
+  const isOllama = pipelineCfg.generationModel.startsWith("ollama:");
+
+  if (isOllama) {
+    // ── Local Ollama LLM generation ──────────────────────────────────────────
+    const ollamaModel = pipelineCfg.generationModel.slice("ollama:".length);
+    try {
+      console.log(`[query] Using Ollama model: ${ollamaModel}`);
+      const result = await generateWithOllama(ollamaModel, sysInstruction, userPrompt);
+      ragAnswer = result.answer;
+      faithfulnessScore = result.faithfulnessScore;
+      relevanceScore = result.relevanceScore;
+    } catch (err) {
+      console.error("[query] Ollama generation failed:", err);
+      ragAnswer = `[Ollama Error] ${String(err)}\n\nRetrieved context:\n\n${retrievedContext || "No context found."}`;
+    }
+  } else if (ai) {
+    // ── Gemini cloud generation ──────────────────────────────────────────────
+    try {
       const response = await ai.models.generateContent({
         model: pipelineCfg.generationModel,
         contents: userPrompt,
@@ -778,7 +873,7 @@ Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceSc
 
   if (!ragAnswer) {
     if (topResults.length > 0) {
-      ragAnswer = `[Offline Mode] Based on "${topResults[0].chunk.sourceName}":\n\n${topResults[0].chunk.text}\n\n(Configure GEMINI_API_KEY for full AI generation.)`;
+      ragAnswer = `[Offline Mode] Based on "${topResults[0].chunk.sourceName}":\n\n${topResults[0].chunk.text}\n\n(Configure GEMINI_API_KEY or set pipeline to ollama:model-name for AI generation.)`;
       faithfulnessScore = 95; relevanceScore = 80;
     } else {
       ragAnswer = "No context found matching your query. Please upload documents in the Knowledge Base first.";
@@ -869,6 +964,435 @@ app.post("/api/test-connectivity", (req, res) => {
   setTimeout(() => {
     res.json({ success: true, message: "Connection to Vector DB succeeded!" });
   }, 1000);
+});
+
+// ─── Agent API — Key Management & RAG Endpoints ───────────────────────────────
+//
+// External AI agents (LangChain, LlamaIndex, custom bots, etc.) call these
+// routes with the header:  X-API-Key: mrmk_<secret>
+//
+// Three public-facing agent endpoints:
+//   POST /api/agent/retrieve  — pure vector search, no LLM generation
+//   POST /api/agent/query     — full RAG (retrieve + generate), simplified response
+//   GET  /api/agent/sources   — list available knowledge-base sources
+//
+// Management endpoints (internal / dashboard):
+//   GET    /api/agent/keys         — list all keys (keys are masked)
+//   POST   /api/agent/keys         — create a new key (returns full key once)
+//   PATCH  /api/agent/keys/:id     — update label / rateLimit / pipelineId / sourceFilter / enabled
+//   DELETE /api/agent/keys/:id     — revoke key
+
+interface AgentApiKey {
+  id: string;
+  label: string;
+  key: string;          // full secret — never sent to the browser after creation
+  keyPreview: string;   // "mrmk_****...****<last4>"
+  pipelineId: string | null;
+  sourceFilter: string[];
+  rateLimit: number;    // req/min, 0 = unlimited
+  enabled: boolean;
+  createdAt: string;
+  lastUsedAt: string | null;
+  usageCount: number;
+  usageThisMonth: number;
+  _monthStamp: string;  // "YYYY-MM" for monthly reset
+}
+
+// In-memory store — seeded with one demo key
+let agentKeys: AgentApiKey[] = [
+  {
+    id: "akey-1",
+    label: "Demo LangChain Agent",
+    key: "mrmk_demo_0000000000000000000000000000000000000000000000000000000000000000",
+    keyPreview: "mrmk_demo_****...****0000",
+    pipelineId: null,
+    sourceFilter: [],
+    rateLimit: 60,
+    enabled: true,
+    createdAt: new Date(Date.now() - 86400000 * 5).toISOString(),
+    lastUsedAt: new Date(Date.now() - 3600000).toISOString(),
+    usageCount: 142,
+    usageThisMonth: 89,
+    _monthStamp: new Date().toISOString().slice(0, 7),
+  },
+];
+
+/** Generate a cryptographically random API key string. */
+function generateApiKey(): string {
+  // 32 random bytes → 64 hex chars
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+  return `mrmk_${hex}`;
+}
+
+/** Mask an API key for display: show prefix + last 4 chars only. */
+function maskKey(key: string): string {
+  const parts = key.split("_");
+  const prefix = parts.slice(0, 2).join("_"); // "mrmk_" or "mrmk_demo"
+  return `${prefix}_****...****${key.slice(-4)}`;
+}
+
+/** Per-key in-memory rate limiter: { [keyId]: { windowStart: number, count: number } } */
+const _rateLimitWindows: Record<string, { windowStart: number; count: number }> = {};
+
+/**
+ * Middleware: validate X-API-Key header and attach the resolved key record to req.
+ * Enforces rate limiting and enabled/disabled state.
+ */
+function agentAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const raw = req.headers["x-api-key"] as string | undefined;
+  if (!raw) {
+    res.status(401).json({ error: "Missing X-API-Key header." });
+    return;
+  }
+  const keyRecord = agentKeys.find(k => k.key === raw);
+  if (!keyRecord) {
+    res.status(401).json({ error: "Invalid API key." });
+    return;
+  }
+  if (!keyRecord.enabled) {
+    res.status(403).json({ error: "This API key has been disabled." });
+    return;
+  }
+
+  // Rate limit check (sliding 60-second window)
+  if (keyRecord.rateLimit > 0) {
+    const now = Date.now();
+    const win = _rateLimitWindows[keyRecord.id] ?? { windowStart: now, count: 0 };
+    if (now - win.windowStart > 60_000) {
+      win.windowStart = now;
+      win.count = 0;
+    }
+    win.count++;
+    _rateLimitWindows[keyRecord.id] = win;
+    if (win.count > keyRecord.rateLimit) {
+      res.status(429).json({ error: `Rate limit exceeded. Max ${keyRecord.rateLimit} req/min.` });
+      return;
+    }
+  }
+
+  // Update usage counters
+  const nowIso = new Date().toISOString();
+  const monthStamp = nowIso.slice(0, 7);
+  keyRecord.lastUsedAt = nowIso;
+  keyRecord.usageCount++;
+  if (keyRecord._monthStamp !== monthStamp) {
+    keyRecord._monthStamp = monthStamp;
+    keyRecord.usageThisMonth = 0;
+  }
+  keyRecord.usageThisMonth++;
+
+  // Attach to request for downstream handlers
+  (req as any)._agentKey = keyRecord;
+  next();
+}
+
+// ── Management: list keys (masked) ────────────────────────────────────────────
+app.get("/api/agent/keys", (req, res) => {
+  res.json(agentKeys.map(k => ({ ...k, key: undefined, keyPreview: k.keyPreview })));
+});
+
+// ── Management: create key ─────────────────────────────────────────────────────
+app.post("/api/agent/keys", (req, res) => {
+  const { label, pipelineId, sourceFilter, rateLimit } = req.body;
+  if (!label || !label.trim()) {
+    res.status(400).json({ error: "label is required" });
+    return;
+  }
+  const fullKey = generateApiKey();
+  const newKey: AgentApiKey = {
+    id: `akey-${Date.now()}`,
+    label: label.trim(),
+    key: fullKey,
+    keyPreview: maskKey(fullKey),
+    pipelineId: pipelineId ?? null,
+    sourceFilter: sourceFilter ?? [],
+    rateLimit: typeof rateLimit === "number" ? rateLimit : 60,
+    enabled: true,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+    usageCount: 0,
+    usageThisMonth: 0,
+    _monthStamp: new Date().toISOString().slice(0, 7),
+  };
+  agentKeys.push(newKey);
+  // Return the FULL key in this response only — browser must copy it now
+  res.status(201).json({ ...newKey, key: fullKey });
+});
+
+// ── Management: update key ─────────────────────────────────────────────────────
+app.patch("/api/agent/keys/:id", (req, res) => {
+  const key = agentKeys.find(k => k.id === req.params.id);
+  if (!key) { res.status(404).json({ error: "Key not found" }); return; }
+  const { label, pipelineId, sourceFilter, rateLimit, enabled } = req.body;
+  if (label !== undefined) key.label = label;
+  if (pipelineId !== undefined) key.pipelineId = pipelineId;
+  if (sourceFilter !== undefined) key.sourceFilter = sourceFilter;
+  if (typeof rateLimit === "number") key.rateLimit = rateLimit;
+  if (typeof enabled === "boolean") key.enabled = enabled;
+  res.json({ ...key, key: undefined, keyPreview: key.keyPreview });
+});
+
+// ── Management: revoke key ─────────────────────────────────────────────────────
+app.delete("/api/agent/keys/:id", (req, res) => {
+  const idx = agentKeys.findIndex(k => k.id === req.params.id);
+  if (idx === -1) { res.status(404).json({ error: "Key not found" }); return; }
+  agentKeys.splice(idx, 1);
+  res.json({ message: "Key revoked" });
+});
+
+// ── Agent: list available sources ──────────────────────────────────────────────
+// GET /api/agent/sources
+// Returns the set of Synced source documents the agent may query against.
+// Response: { sources: [{ id, name, type, vectorsCount, lastSync }] }
+app.get("/api/agent/sources", agentAuth, (req, res) => {
+  const agentKey = (req as any)._agentKey as AgentApiKey;
+  // Apply source filter from key config
+  const allowed = agentKey.sourceFilter.length > 0
+    ? dataSources.filter(s => s.status === "Synced" && agentKey.sourceFilter.includes(s.id))
+    : dataSources.filter(s => s.status === "Synced");
+  res.json({
+    sources: allowed.map(s => ({
+      id: s.id,
+      name: s.name,
+      type: s.type,
+      vectorsCount: s.vectorsCount,
+      lastSync: s.lastSync,
+    })),
+  });
+});
+
+// ── Agent: pure vector retrieval (no generation) ───────────────────────────────
+// POST /api/agent/retrieve
+// Body: { query: string, topK?: number, minScore?: number, sourceFilter?: string[] }
+// Response: { query, chunks: [{ id, sourceId, sourceName, text, score }], latencyMs }
+//
+// Use this when your agent has its own LLM and only needs relevant context chunks.
+app.post("/api/agent/retrieve", agentAuth, async (req, res) => {
+  const agentKey = (req as any)._agentKey as AgentApiKey;
+  const { query, topK = 5, minScore = 0.0, sourceFilter: reqSourceFilter } = req.body;
+
+  if (!query || typeof query !== "string") {
+    res.status(400).json({ error: "query (string) is required" });
+    return;
+  }
+
+  const startTime = Date.now();
+
+  // Embed query
+  let queryEmbedding: number[];
+  try {
+    queryEmbedding = await embedText(query);
+  } catch (err) {
+    res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
+    return;
+  }
+
+  // Merge key-level + request-level source filters
+  const keyFilter = agentKey.sourceFilter;
+  const reqFilter: string[] = Array.isArray(reqSourceFilter) ? reqSourceFilter : [];
+  const effectiveFilter = keyFilter.length > 0
+    ? (reqFilter.length > 0 ? keyFilter.filter(id => reqFilter.includes(id)) : keyFilter)
+    : reqFilter;
+
+  const excludedIds = dataSources
+    .filter(d => d.status === "Paused" || d.status === "Auth Error")
+    .map(d => d.id);
+
+  const pgResults = await searchChunks(queryEmbedding, (topK as number) * 2, excludedIds);
+  const filtered = pgResults
+    .filter(r => {
+      if (r.score < (minScore as number)) return false;
+      if (effectiveFilter.length > 0 && !effectiveFilter.includes(r.sourceId)) return false;
+      return true;
+    })
+    .slice(0, topK as number);
+
+  res.json({
+    query,
+    chunks: filtered.map(r => ({
+      id: r.id,
+      sourceId: r.sourceId,
+      sourceName: r.sourceName,
+      text: r.text,
+      score: Math.round(r.score * 10000) / 10000,
+    })),
+    latencyMs: Date.now() - startTime,
+  });
+});
+
+// ── Agent: full RAG query (retrieve + generate) ────────────────────────────────
+// POST /api/agent/query
+// Body: { query: string, pipeline?: string, topK?: number, minScore?: number, sourceFilter?: string[] }
+// Response: { answer, pipeline, faithfulnessScore, relevanceScore, latencyMs, sources }
+//
+// This is the "one-shot" endpoint — the agent sends a question, gets a grounded answer.
+// pipeline name is optional; if omitted, the key's bound pipeline is used; falls back to first enabled.
+app.post("/api/agent/query", agentAuth, async (req, res) => {
+  const agentKey = (req as any)._agentKey as AgentApiKey;
+  const { query, pipeline: pipelineName, topK: reqTopK, minScore: reqMinScore, sourceFilter: reqSourceFilter } = req.body;
+
+  if (!query || typeof query !== "string") {
+    res.status(400).json({ error: "query (string) is required" });
+    return;
+  }
+
+  // Resolve pipeline
+  let pipelineCfg: Pipeline;
+  if (pipelineName) {
+    pipelineCfg = pipelines.find(p => p.name === pipelineName && p.enabled)
+      ?? pipelines.find(p => p.enabled)
+      ?? { id: "default", name: "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
+  } else if (agentKey.pipelineId) {
+    pipelineCfg = pipelines.find(p => p.id === agentKey.pipelineId && p.enabled)
+      ?? pipelines.find(p => p.enabled)
+      ?? { id: "default", name: "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
+  } else {
+    pipelineCfg = pipelines.find(p => p.enabled)
+      ?? { id: "default", name: "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
+  }
+
+  // Request-level overrides (optional)
+  const effectiveTopK = typeof reqTopK === "number" ? reqTopK : pipelineCfg.topK;
+  const effectiveMinScore = typeof reqMinScore === "number" ? reqMinScore : pipelineCfg.minScore;
+
+  // Merge source filters: key-level ∩ request-level (if any)
+  const keyFilter = agentKey.sourceFilter;
+  const reqFilter: string[] = Array.isArray(reqSourceFilter) ? reqSourceFilter : [];
+  const pipeFilter = pipelineCfg.sourceFilter;
+  // Priority: request > key > pipeline (intersect where both set)
+  let effectiveFilter: string[] = pipeFilter;
+  if (keyFilter.length > 0) effectiveFilter = effectiveFilter.length > 0 ? effectiveFilter.filter(id => keyFilter.includes(id)) : keyFilter;
+  if (reqFilter.length > 0) effectiveFilter = effectiveFilter.length > 0 ? effectiveFilter.filter(id => reqFilter.includes(id)) : reqFilter;
+
+  const startTime = Date.now();
+
+  // Embed
+  let queryEmbedding: number[];
+  try {
+    queryEmbedding = await embedText(query);
+  } catch (err) {
+    res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
+    return;
+  }
+
+  const excludedIds = dataSources
+    .filter(d => d.status === "Paused" || d.status === "Auth Error")
+    .map(d => d.id);
+
+  const pgResults = await searchChunks(queryEmbedding, effectiveTopK * 2, excludedIds);
+  const topResults = pgResults
+    .filter(r => {
+      if (r.score < effectiveMinScore) return false;
+      if (effectiveFilter.length > 0 && !effectiveFilter.includes(r.sourceId)) return false;
+      return true;
+    })
+    .slice(0, effectiveTopK);
+
+  const retrievedContext = topResults
+    .map((r, i) => `[Document ${i + 1}: ${r.sourceName}]\n${r.text}`)
+    .join("\n\n");
+
+  const ai = getAI();
+  let ragAnswer = "";
+  let faithfulnessScore = 90;
+  let relevanceScore = 85;
+
+  const sysInstruction = pipelineCfg.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
+  const userPrompt = `You are a highly analytical RAG Retrieval QA System.
+Below is the User's Query and the Retrieved Context Chunks from the document database.
+
+USER QUERY:
+"${query}"
+
+RETRIEVED CONTEXT CHUNKS:
+${retrievedContext || "NO RELEVANT CONTEXT FOUND"}
+
+INSTRUCTIONS:
+1. Answer the query truthfully based ONLY on the retrieved context chunks.
+2. Cite your sources using bracketed notations like [Source Name].
+3. Ensure absolute accuracy. Do not make up facts.
+4. If any retrieved context chunk contains an HTML <img> tag, preserve it in your answer.
+5. Evaluate yourself and provide faithfulnessScore (0-100) and relevanceScore (0-100).
+
+Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceScore": 90 }`;
+
+  const isOllama = pipelineCfg.generationModel.startsWith("ollama:");
+
+  if (isOllama) {
+    const ollamaModel = pipelineCfg.generationModel.slice("ollama:".length);
+    try {
+      const result = await generateWithOllama(ollamaModel, sysInstruction, userPrompt);
+      ragAnswer = result.answer;
+      faithfulnessScore = result.faithfulnessScore;
+      relevanceScore = result.relevanceScore;
+    } catch (err) {
+      ragAnswer = `[Ollama Error] ${String(err)}\n\nRetrieved context:\n\n${retrievedContext || "No context found."}`;
+    }
+  } else if (ai) {
+    try {
+      const response = await ai.models.generateContent({
+        model: pipelineCfg.generationModel,
+        contents: userPrompt,
+        config: {
+          systemInstruction: sysInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: { answer: { type: Type.STRING }, faithfulnessScore: { type: Type.INTEGER }, relevanceScore: { type: Type.INTEGER } },
+            required: ["answer", "faithfulnessScore", "relevanceScore"],
+          },
+        },
+      });
+      if (response.text) {
+        const parsed = JSON.parse(response.text.trim());
+        ragAnswer = parsed.answer;
+        faithfulnessScore = parsed.faithfulnessScore;
+        relevanceScore = parsed.relevanceScore;
+      }
+    } catch (err) {
+      ragAnswer = `Failed to generate response. Retrieved context:\n\n${retrievedContext || "No context found."}`;
+    }
+  }
+
+  if (!ragAnswer) {
+    ragAnswer = topResults.length > 0
+      ? `[Offline Mode] ${topResults[0].text}`
+      : "No context found matching your query.";
+  }
+
+  const latencyMs = Date.now() - startTime;
+
+  // Log the agent query alongside regular query logs
+  const newLog: QueryLog = {
+    id: `log-${Date.now()}`,
+    timestamp: new Date().toLocaleTimeString("en-US", { hour12: false }),
+    query,
+    pipeline: `${pipelineCfg.name} [agent:${agentKey.label}]`,
+    answer: ragAnswer,
+    faithfulnessScore,
+    relevanceScore,
+    latencyMs,
+    status: faithfulnessScore > 85 ? "success" : "warning",
+    retrievedChunks: topResults.map(r => ({ text: r.text, sourceName: r.sourceName, score: Math.round(r.score * 100) / 100 })),
+  };
+  queryLogs.unshift(newLog);
+
+  // Simplified response for agents
+  res.json({
+    answer: ragAnswer,
+    pipeline: pipelineCfg.name,
+    faithfulnessScore,
+    relevanceScore,
+    latencyMs,
+    sources: topResults.map(r => ({
+      id: r.id,
+      sourceName: r.sourceName,
+      score: Math.round(r.score * 10000) / 10000,
+      excerpt: r.text.slice(0, 200),
+    })),
+  });
 });
 
 // --- Vite setup or production static server ---

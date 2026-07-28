@@ -39,10 +39,18 @@ import {
   Pencil,
   X,
   ToggleLeft,
-  ToggleRight
+  ToggleRight,
+  Copy,
+  Zap,
+  BookOpen,
+  Code2,
+  EyeOff,
+  Eye,
+  Radio,
+  Activity
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { SourceDoc, QueryLog, StrategyConfig, TabType, IndexingProgress, Pipeline, PipelineStats } from "./types";
+import { SourceDoc, QueryLog, StrategyConfig, TabType, IndexingProgress, Pipeline, PipelineStats, AgentApiKey } from "./types";
 
 // Custom RAG Response Renderer that beautifully supports HTML hotlinked images & formatting
 function SafeRAGResponseRenderer({ text, isDark = true }: { text: string; isDark?: boolean }) {
@@ -145,6 +153,16 @@ export default function App() {
   const [users, setUsers] = useState<any[]>([]);
   const [healthStatus, setHealthStatus] = useState<{ pgConnected?: boolean; ollamaConnected?: boolean; geminiActive?: boolean; pgHost?: string; pgDatabase?: string; ollamaBaseUrl?: string } | null>(null);
   const [pipelines, setPipelines] = useState<PipelineWithStats[]>([]);
+  const [agentKeys, setAgentKeys] = useState<AgentApiKey[]>([]);
+
+  // API Access tab state
+  const [isNewKeyOpen, setIsNewKeyOpen] = useState(false);
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [newKeyPipelineId, setNewKeyPipelineId] = useState<string>("");
+  const [newKeyRateLimit, setNewKeyRateLimit] = useState(60);
+  const [newKeySourceFilter, setNewKeySourceFilter] = useState<string[]>([]);
+  const [newKeyCreatedSecret, setNewKeyCreatedSecret] = useState<string | null>(null); // shown once
+  const [apiDocsTab, setApiDocsTab] = useState<"retrieve" | "query" | "sources">("query");
 
   // Pipeline editor state
   const [isPipelineDrawerOpen, setIsPipelineDrawerOpen] = useState(false);
@@ -190,13 +208,14 @@ export default function App() {
   // Load All Initial Data
   const loadData = async () => {
     try {
-      const [resSources, resLogs, resConfig, resUsers, resHealth, resPipelines] = await Promise.all([
+      const [resSources, resLogs, resConfig, resUsers, resHealth, resPipelines, resKeys] = await Promise.all([
         fetch("/api/sources").then(r => r.json()),
         fetch("/api/logs").then(r => r.json()),
         fetch("/api/config").then(r => r.json()),
         fetch("/api/users").then(r => r.json()),
         fetch("/api/health").then(r => r.json()),
         fetch("/api/pipelines").then(r => r.json()),
+        fetch("/api/agent/keys").then(r => r.json()),
       ]);
       setSources(resSources);
       setLogs(resLogs);
@@ -205,6 +224,7 @@ export default function App() {
       setUsers(resUsers);
       setHealthStatus(resHealth);
       setPipelines(resPipelines);
+      setAgentKeys(resKeys);
     } catch (err) {
       console.error("Error loading API data:", err);
       showToast("Error connecting to server. Make sure dev server is running.", "error");
@@ -502,6 +522,61 @@ export default function App() {
     }
   };
 
+  // ─── Agent API Key Handlers ───────────────────────────────────────────────
+  const handleCreateApiKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newKeyLabel.trim()) return;
+    try {
+      const res = await fetch("/api/agent/keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: newKeyLabel,
+          pipelineId: newKeyPipelineId || null,
+          sourceFilter: newKeySourceFilter,
+          rateLimit: newKeyRateLimit,
+        }),
+      });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
+      const data = await res.json();
+      // Show the full key once — it won't be retrievable again
+      setNewKeyCreatedSecret(data.key);
+      setAgentKeys(prev => [...prev, { ...data, key: undefined }]);
+      setNewKeyLabel("");
+      setNewKeyPipelineId("");
+      setNewKeyRateLimit(60);
+      setNewKeySourceFilter([]);
+      setIsNewKeyOpen(false);
+    } catch (err: any) {
+      showToast(err.message || "Failed to create API key.", "error");
+    }
+  };
+
+  const handleToggleApiKey = async (keyId: string, enabled: boolean) => {
+    try {
+      await fetch(`/api/agent/keys/${keyId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      setAgentKeys(prev => prev.map(k => k.id === keyId ? { ...k, enabled } : k));
+      showToast(enabled ? "API key enabled." : "API key disabled.", "info");
+    } catch {
+      showToast("Failed to update key.", "error");
+    }
+  };
+
+  const handleRevokeApiKey = async (keyId: string) => {
+    try {
+      await fetch(`/api/agent/keys/${keyId}`, { method: "DELETE" });
+      setAgentKeys(prev => prev.filter(k => k.id !== keyId));
+      showToast("API key revoked.", "info");
+    } catch {
+      showToast("Failed to revoke key.", "error");
+    }
+  };
+  // ─────────────────────────────────────────────────────────────────────────
+
   // Toggle SSO
   const handleToggleSSO = (checked: boolean) => {
     const updated = { ...pendingConfig, ssoEnabled: checked };
@@ -611,16 +686,34 @@ export default function App() {
           </button>
 
           {/* RAG Playground Tab */}
-          <button 
+          <button
             onClick={() => setActiveTab("playground")}
             className={`w-full flex items-center gap-3 px-3 py-2 rounded text-xs font-semibold transition-all text-left ${
-              activeTab === "playground" 
-                ? "text-black bg-[#ccff00]" 
+              activeTab === "playground"
+                ? "text-black bg-[#ccff00]"
                 : "text-white/60 hover:bg-white/[0.04] hover:text-[#ccff00]"
             }`}
           >
             <Flame className={`w-4 h-4 ${activeTab === "playground" ? "text-black" : "text-[#ccff00]"}`} />
             <span>RAG Playground</span>
+          </button>
+
+          {/* API Access Tab */}
+          <button
+            onClick={() => setActiveTab("api-access")}
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded text-xs font-semibold transition-all text-left ${
+              activeTab === "api-access"
+                ? "text-black bg-[#ccff00]"
+                : "text-white/60 hover:bg-white/[0.04] hover:text-white"
+            }`}
+          >
+            <Zap className="w-4 h-4" />
+            <span>Agent API Access</span>
+            {agentKeys.length > 0 && (
+              <span className={`ml-auto text-[9px] font-mono font-bold px-1.5 py-0.5 rounded ${activeTab === "api-access" ? "bg-black/20 text-black" : "bg-[#ccff00]/10 text-[#ccff00] border border-[#ccff00]/20"}`}>
+                {agentKeys.length}
+              </span>
+            )}
           </button>
         </nav>
 
@@ -2215,45 +2308,511 @@ export default function App() {
               )}
             </div>
           )}
+
+          {/* ═══════════════════════════════════════════════════════════════
+              API ACCESS TAB — Agent API Key Management + Endpoint Docs
+          ═══════════════════════════════════════════════════════════════ */}
+          {activeTab === "api-access" && (
+            <div className="space-y-8 animate-in fade-in duration-300">
+
+              {/* Header */}
+              <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="bg-[#ccff00]/10 text-[#ccff00] text-[10px] uppercase tracking-wider font-extrabold px-2 py-0.5 rounded font-mono border border-[#ccff00]/20">External Integration</span>
+                  </div>
+                  <h2 className="font-display text-2xl font-extrabold text-white tracking-tight">Agent API Access</h2>
+                  <p className="text-white/40 text-xs font-semibold mt-1 max-w-2xl">
+                    Issue API keys to external AI agents (LangChain, LlamaIndex, custom bots). Each key authenticates via <span className="font-mono text-white/70">X-API-Key</span> header and can be scoped to specific pipelines and knowledge sources.
+                  </p>
+                </div>
+                <button
+                  onClick={() => setIsNewKeyOpen(true)}
+                  className="bg-[#ccff00] text-black font-bold text-xs px-4 py-2.5 rounded hover:opacity-95 flex items-center gap-1.5 transition-all uppercase tracking-widest cursor-pointer shrink-0"
+                >
+                  <Plus className="w-4 h-4" />
+                  Issue New Key
+                </button>
+              </div>
+
+              {/* One-time key reveal modal */}
+              <AnimatePresence>
+                {newKeyCreatedSecret && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.96 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.96 }}
+                    className="fixed inset-0 flex items-center justify-center z-50 bg-black/80"
+                  >
+                    <div className="bg-[#080808] border border-[#ccff00]/40 rounded p-8 max-w-lg w-full mx-4 space-y-5 shadow-2xl">
+                      <div className="flex items-center gap-3">
+                        <CheckCircle className="w-6 h-6 text-[#ccff00]" />
+                        <h3 className="font-display text-sm font-bold text-white uppercase tracking-wider">API Key Created — Copy Now</h3>
+                      </div>
+                      <div className="bg-amber-500/10 border border-amber-500/30 rounded p-3 flex items-start gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                        <p className="text-xs text-amber-300 font-medium">This is the <strong>only time</strong> you will see this key. It cannot be recovered after closing this dialog.</p>
+                      </div>
+                      <div className="bg-black rounded border border-white/10 p-4 flex items-center gap-3">
+                        <code className="text-xs font-mono text-[#ccff00] break-all flex-1 select-all">{newKeyCreatedSecret}</code>
+                        <button
+                          onClick={() => { navigator.clipboard.writeText(newKeyCreatedSecret); showToast("API key copied to clipboard!", "success"); }}
+                          className="p-2 rounded bg-white/5 hover:bg-[#ccff00]/10 text-white/60 hover:text-[#ccff00] transition-colors shrink-0 cursor-pointer"
+                          title="Copy to clipboard"
+                        >
+                          <Copy className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <div className="pt-2 flex justify-end">
+                        <button
+                          onClick={() => setNewKeyCreatedSecret(null)}
+                          className="px-5 py-2 bg-[#ccff00] text-black text-xs font-bold rounded hover:opacity-90 uppercase tracking-widest cursor-pointer"
+                        >
+                          I've saved the key — Close
+                        </button>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* New Key Form */}
+              <AnimatePresence>
+                {isNewKeyOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    className="bg-[#080808] border border-white/10 rounded p-6 overflow-hidden"
+                  >
+                    <div className="flex justify-between items-center border-b border-white/10 pb-3 mb-5">
+                      <h3 className="font-display text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2">
+                        <Key className="w-4 h-4 text-[#ccff00]" /> Issue New API Key
+                      </h3>
+                      <button onClick={() => setIsNewKeyOpen(false)} className="text-white/40 hover:text-white cursor-pointer"><X className="w-4 h-4" /></button>
+                    </div>
+                    <form onSubmit={handleCreateApiKey} className="space-y-5">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Key Label *</label>
+                          <input
+                            type="text"
+                            required
+                            placeholder="e.g. LangChain Prod Bot"
+                            value={newKeyLabel}
+                            onChange={e => setNewKeyLabel(e.target.value)}
+                            className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-semibold text-white outline-none focus:ring-1 focus:ring-[#ccff00]"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Bound Pipeline <span className="normal-case text-white/30">(optional — agent can override)</span></label>
+                          <select
+                            value={newKeyPipelineId}
+                            onChange={e => setNewKeyPipelineId(e.target.value)}
+                            className="p-2.5 bg-black/60 border border-white/10 rounded text-xs font-semibold text-white outline-none focus:ring-1 focus:ring-[#ccff00] cursor-pointer"
+                          >
+                            <option value="">— Any enabled pipeline —</option>
+                            {pipelines.filter(p => p.enabled).map(p => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between">
+                          <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Rate Limit (req/min)</label>
+                          <span className="text-xs font-mono font-bold text-[#ccff00]">{newKeyRateLimit === 0 ? "Unlimited" : `${newKeyRateLimit} req/min`}</span>
+                        </div>
+                        <input
+                          type="range" min={0} max={600} step={10}
+                          value={newKeyRateLimit}
+                          onChange={e => setNewKeyRateLimit(Number(e.target.value))}
+                          className="w-full accent-[#ccff00] cursor-pointer"
+                        />
+                        <div className="flex justify-between text-[9px] font-mono text-white/20">
+                          <span>0 (unlimited)</span><span>600 req/min</span>
+                        </div>
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[10px] font-mono uppercase tracking-wider text-white/60">Source Filter <span className="normal-case text-white/30">(blank = all Synced sources)</span></label>
+                        <div className="grid grid-cols-2 md:grid-cols-3 gap-2 max-h-28 overflow-y-auto pr-1">
+                          {sources.filter(s => s.status === "Synced").map(s => {
+                            const checked = newKeySourceFilter.includes(s.id);
+                            return (
+                              <label key={s.id} className="flex items-center gap-2 cursor-pointer group text-xs font-semibold text-white/60 group-hover:text-white">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => setNewKeySourceFilter(prev =>
+                                    checked ? prev.filter(id => id !== s.id) : [...prev, s.id]
+                                  )}
+                                  className="accent-[#ccff00] cursor-pointer"
+                                />
+                                <span className="truncate">{s.name}</span>
+                              </label>
+                            );
+                          })}
+                          {sources.filter(s => s.status === "Synced").length === 0 && (
+                            <p className="text-[10px] text-white/20 font-mono col-span-3">No synced documents yet.</p>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex justify-end gap-3 pt-2 border-t border-white/10">
+                        <button type="button" onClick={() => setIsNewKeyOpen(false)} className="px-4 py-2 border border-white/10 rounded text-xs font-bold text-white/50 hover:text-white cursor-pointer">Cancel</button>
+                        <button type="submit" className="px-5 py-2 bg-[#ccff00] text-black text-xs font-bold rounded hover:opacity-90 uppercase tracking-widest cursor-pointer">Issue Key</button>
+                      </div>
+                    </form>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Keys Table */}
+              <div className="bg-[#080808] rounded border border-white/10 overflow-hidden">
+                <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
+                  <h3 className="font-display text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                    <Key className="w-4 h-4 text-[#ccff00]" /> Issued API Keys
+                  </h3>
+                  <span className="text-[10px] font-mono text-white/40">{agentKeys.filter(k => k.enabled).length} active · {agentKeys.length} total</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead className="bg-white/5 border-b border-white/10">
+                      <tr>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">Label</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">Key</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">Pipeline</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">Rate Limit</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">Usage</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest">Last Used</th>
+                        <th className="px-6 py-3 text-[10px] font-mono font-bold text-white/40 uppercase tracking-widest text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/10">
+                      {agentKeys.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="px-6 py-10 text-center text-xs text-white/30 font-mono">
+                            No API keys issued yet. Click <span className="text-[#ccff00]">Issue New Key</span> to get started.
+                          </td>
+                        </tr>
+                      ) : agentKeys.map(k => {
+                        const boundPipeline = k.pipelineId ? pipelines.find(p => p.id === k.pipelineId) : null;
+                        return (
+                          <tr key={k.id} className={`hover:bg-white/[0.02] transition-colors group ${!k.enabled ? "opacity-50" : ""}`}>
+                            <td className="px-6 py-4">
+                              <div className="flex items-center gap-2.5">
+                                <div className={`w-2 h-2 rounded-full shrink-0 ${k.enabled ? "bg-[#ccff00] animate-pulse" : "bg-white/20"}`}></div>
+                                <span className="text-xs font-bold text-white">{k.label}</span>
+                              </div>
+                              <span className="text-[10px] text-white/30 font-mono block mt-0.5 pl-4.5">{k.id}</span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <code className="text-[10px] font-mono text-white/60 bg-white/5 border border-white/10 px-2 py-1 rounded">{k.keyPreview}</code>
+                            </td>
+                            <td className="px-6 py-4">
+                              {boundPipeline ? (
+                                <span className="text-[10px] font-mono text-[#ccff00] bg-[#ccff00]/10 border border-[#ccff00]/20 px-2 py-0.5 rounded font-bold">{boundPipeline.name}</span>
+                              ) : (
+                                <span className="text-[10px] font-mono text-white/30">Any pipeline</span>
+                              )}
+                            </td>
+                            <td className="px-6 py-4 text-xs font-mono text-white/60">
+                              {k.rateLimit === 0 ? "∞ Unlimited" : `${k.rateLimit}/min`}
+                            </td>
+                            <td className="px-6 py-4">
+                              <div>
+                                <span className="text-xs font-mono font-bold text-[#ccff00]">{k.usageCount.toLocaleString()}</span>
+                                <span className="text-[10px] text-white/30 font-mono block">{k.usageThisMonth} this month</span>
+                              </div>
+                            </td>
+                            <td className="px-6 py-4 text-xs text-white/50 font-mono">
+                              {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "Never"}
+                            </td>
+                            <td className="px-6 py-4 text-right">
+                              <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button
+                                  onClick={() => handleToggleApiKey(k.id, !k.enabled)}
+                                  title={k.enabled ? "Disable key" : "Enable key"}
+                                  className="p-1.5 rounded hover:bg-white/10 text-white/40 hover:text-[#ccff00] transition-colors cursor-pointer"
+                                >
+                                  {k.enabled ? <ToggleRight className="w-4 h-4 text-[#ccff00]" /> : <ToggleLeft className="w-4 h-4" />}
+                                </button>
+                                <button
+                                  onClick={() => handleRevokeApiKey(k.id)}
+                                  title="Revoke key"
+                                  className="p-1.5 rounded hover:bg-red-500/10 text-white/40 hover:text-red-500 transition-colors cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* API Endpoint Reference Docs */}
+              <section className="bg-[#080808] rounded border border-white/10 overflow-hidden">
+                <div className="px-6 py-4 border-b border-white/10 flex items-center gap-3">
+                  <BookOpen className="w-4 h-4 text-[#ccff00]" />
+                  <h3 className="font-display text-sm font-bold text-white uppercase tracking-wider">API Endpoint Reference</h3>
+                  <span className="ml-auto text-[10px] font-mono text-white/30">Base: <code className="text-white/60">http://your-host:3000</code></span>
+                </div>
+
+                {/* Tab selector */}
+                <div className="flex border-b border-white/10">
+                  {([
+                    { id: "query", label: "POST /agent/query", desc: "Full RAG (retrieve + generate)" },
+                    { id: "retrieve", label: "POST /agent/retrieve", desc: "Vector search only" },
+                    { id: "sources", label: "GET /agent/sources", desc: "List knowledge sources" },
+                  ] as const).map(tab => (
+                    <button
+                      key={tab.id}
+                      onClick={() => setApiDocsTab(tab.id)}
+                      className={`px-5 py-3 text-xs font-mono font-bold border-b-2 transition-all cursor-pointer ${
+                        apiDocsTab === tab.id
+                          ? "border-[#ccff00] text-[#ccff00] bg-[#ccff00]/5"
+                          : "border-transparent text-white/40 hover:text-white"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="p-6 space-y-5">
+                  {apiDocsTab === "query" && (
+                    <div className="space-y-5">
+                      <div className="flex items-start gap-4">
+                        <div className="shrink-0">
+                          <span className="text-[10px] font-mono font-bold bg-blue-500/20 text-blue-300 border border-blue-500/30 px-2 py-1 rounded uppercase">POST</span>
+                        </div>
+                        <div>
+                          <code className="text-sm font-mono text-white font-bold">/api/agent/query</code>
+                          <p className="text-xs text-white/40 mt-1">Full RAG pipeline — embeds the query, retrieves top-K context chunks, and generates a grounded LLM answer. Automatically logs to the system query log.</p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <div>
+                          <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Request Headers</p>
+                          <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-white/70 overflow-x-auto">{`Content-Type: application/json
+X-API-Key: mrmk_<your_secret_key>`}</pre>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Request Body</p>
+                          <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-white/70 overflow-x-auto">{`{
+  "query": "What are the Q3 revenue figures?",
+  "pipeline": "Doc-Search-Alpha",  // optional
+  "topK": 5,                       // optional, default from pipeline
+  "minScore": 0.3,                 // optional, 0-1
+  "sourceFilter": ["src-1","src-2"] // optional
+}`}</pre>
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Response 200</p>
+                        <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-[#ccff00] overflow-x-auto">{`{
+  "answer": "Q3 revenues increased by 15.4%... [Q3 Financial Reports]",
+  "pipeline": "Doc-Search-Alpha",
+  "faithfulnessScore": 97,
+  "relevanceScore": 93,
+  "latencyMs": 840,
+  "sources": [
+    {
+      "id": "src-1-chk-0",
+      "sourceName": "Q3 Financial Reports",
+      "score": 0.9241,
+      "excerpt": "Revenues increased by 15.4% quarter-over-quarter..."
+    }
+  ]
+}`}</pre>
+                      </div>
+                      <div className="p-3 bg-white/5 border border-white/10 rounded">
+                        <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Python (LangChain-style)</p>
+                        <pre className="text-[10px] font-mono text-white/70 overflow-x-auto">{`import requests
+
+resp = requests.post(
+    "http://your-host:3000/api/agent/query",
+    headers={"X-API-Key": "mrmk_<your_key>"},
+    json={"query": "What are the Q3 revenue figures?"}
+)
+data = resp.json()
+print(data["answer"])`}</pre>
+                      </div>
+                    </div>
+                  )}
+
+                  {apiDocsTab === "retrieve" && (
+                    <div className="space-y-5">
+                      <div className="flex items-start gap-4">
+                        <div className="shrink-0">
+                          <span className="text-[10px] font-mono font-bold bg-blue-500/20 text-blue-300 border border-blue-500/30 px-2 py-1 rounded uppercase">POST</span>
+                        </div>
+                        <div>
+                          <code className="text-sm font-mono text-white font-bold">/api/agent/retrieve</code>
+                          <p className="text-xs text-white/40 mt-1">Pure vector similarity search — returns the top-K matching text chunks with cosine similarity scores. <strong className="text-white/60">No LLM generation.</strong> Ideal for agents that use their own LLM or prompt assembly logic.</p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <div>
+                          <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Request Body</p>
+                          <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-white/70 overflow-x-auto">{`{
+  "query": "compliance rules tier 3",
+  "topK": 5,          // optional, default 5
+  "minScore": 0.0,    // optional, 0-1
+  "sourceFilter": []  // optional, [] = all
+}`}</pre>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Response 200</p>
+                          <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-[#ccff00] overflow-x-auto">{`{
+  "query": "compliance rules tier 3",
+  "latencyMs": 42,
+  "chunks": [
+    {
+      "id": "src-1-chk-0",
+      "sourceId": "src-1",
+      "sourceName": "Q3 Financial Reports",
+      "text": "Standard compliance was fully...",
+      "score": 0.9241
+    }
+  ]
+}`}</pre>
+                        </div>
+                      </div>
+                      <div className="p-3 bg-white/5 border border-white/10 rounded">
+                        <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">curl</p>
+                        <pre className="text-[10px] font-mono text-white/70 overflow-x-auto">{`curl -X POST http://your-host:3000/api/agent/retrieve \\
+  -H "Content-Type: application/json" \\
+  -H "X-API-Key: mrmk_<your_key>" \\
+  -d '{"query": "compliance rules tier 3", "topK": 5}'`}</pre>
+                      </div>
+                    </div>
+                  )}
+
+                  {apiDocsTab === "sources" && (
+                    <div className="space-y-5">
+                      <div className="flex items-start gap-4">
+                        <div className="shrink-0">
+                          <span className="text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-1 rounded uppercase">GET</span>
+                        </div>
+                        <div>
+                          <code className="text-sm font-mono text-white font-bold">/api/agent/sources</code>
+                          <p className="text-xs text-white/40 mt-1">Returns all Synced knowledge-base sources accessible to this API key. Respects the key's <code className="text-white/60">sourceFilter</code> scope.</p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <div>
+                          <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Request</p>
+                          <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-white/70 overflow-x-auto">{`GET /api/agent/sources
+X-API-Key: mrmk_<your_key>`}</pre>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Response 200</p>
+                          <pre className="bg-black/60 border border-white/10 rounded p-4 text-[10px] font-mono text-[#ccff00] overflow-x-auto">{`{
+  "sources": [
+    {
+      "id": "src-1",
+      "name": "Q3 Financial Reports",
+      "type": "PDF Collection",
+      "vectorsCount": 24510,
+      "lastSync": "2 hours ago"
+    }
+  ]
+}`}</pre>
+                        </div>
+                      </div>
+                      <div className="p-3 bg-white/5 border border-white/10 rounded">
+                        <p className="text-[10px] font-mono uppercase tracking-wider text-white/40 mb-2 font-bold">Error Responses</p>
+                        <pre className="text-[10px] font-mono text-white/70 overflow-x-auto">{`401  { "error": "Missing X-API-Key header." }
+401  { "error": "Invalid API key." }
+403  { "error": "This API key has been disabled." }
+429  { "error": "Rate limit exceeded. Max 60 req/min." }
+400  { "error": "query (string) is required" }
+500  { "error": "Embedding failed. Is Ollama running?" }`}</pre>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              {/* Usage overview cards */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-[#080808] p-5 rounded border border-white/10 flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">Total API Calls</span>
+                    <Activity className="w-4 h-4 text-[#ccff00]" />
+                  </div>
+                  <span className="text-3xl font-bold font-mono text-[#ccff00]">
+                    {agentKeys.reduce((sum, k) => sum + k.usageCount, 0).toLocaleString()}
+                  </span>
+                  <span className="text-[10px] text-white/40 font-semibold">Across {agentKeys.length} key(s)</span>
+                </div>
+                <div className="bg-[#080808] p-5 rounded border border-white/10 flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">This Month</span>
+                    <Radio className="w-4 h-4 text-[#ccff00]" />
+                  </div>
+                  <span className="text-3xl font-bold font-mono text-white">
+                    {agentKeys.reduce((sum, k) => sum + k.usageThisMonth, 0).toLocaleString()}
+                  </span>
+                  <span className="text-[10px] text-white/40 font-semibold">{new Date().toLocaleString("en-US", { month: "long", year: "numeric" })}</span>
+                </div>
+                <div className="bg-[#080808] p-5 rounded border border-white/10 flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-white/40">Active Keys</span>
+                    <Key className="w-4 h-4 text-[#ccff00]" />
+                  </div>
+                  <span className="text-3xl font-bold font-mono text-white">
+                    {agentKeys.filter(k => k.enabled).length} <span className="text-sm text-white/30 font-normal">/ {agentKeys.length}</span>
+                  </span>
+                  <span className="text-[10px] text-white/40 font-semibold">{agentKeys.filter(k => !k.enabled).length} disabled</span>
+                </div>
+              </div>
+
+            </div>
+          )}
         </div>
       </main>
 
       {/* Mobile Navigation Bar */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-[#080808] border-t border-white/10 flex justify-around items-center px-4 z-40">
-        <button 
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-[#080808] border-t border-white/10 flex justify-around items-center px-2 z-40" style={{ height: "64px" }}>
+        <button
           onClick={() => setActiveTab("dashboard")}
           className={`flex flex-col items-center gap-1 ${activeTab === "dashboard" ? "text-[#ccff00]" : "text-white/40"}`}
         >
           <LayoutDashboard className="w-5 h-5" />
           <span className="text-[9px] font-mono font-bold uppercase">Home</span>
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab("workspace")}
           className={`flex flex-col items-center gap-1 ${activeTab === "workspace" ? "text-[#ccff00]" : "text-white/40"}`}
         >
           <Sliders className="w-5 h-5" />
-          <span className="text-[9px] font-mono font-bold uppercase">Strategy</span>
+          <span className="text-[9px] font-mono font-bold uppercase">Config</span>
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab("knowledge-base")}
           className={`flex flex-col items-center gap-1 ${activeTab === "knowledge-base" ? "text-[#ccff00]" : "text-white/40"}`}
         >
           <Database className="w-5 h-5" />
           <span className="text-[9px] font-mono font-bold uppercase">KB</span>
         </button>
-        <button 
-          onClick={() => setActiveTab("admin")}
-          className={`flex flex-col items-center gap-1 ${activeTab === "admin" ? "text-[#ccff00]" : "text-white/40"}`}
-        >
-          <Shield className="w-5 h-5" />
-          <span className="text-[9px] font-mono font-bold uppercase">Admin</span>
-        </button>
-        <button 
+        <button
           onClick={() => setActiveTab("playground")}
           className={`flex flex-col items-center gap-1 ${activeTab === "playground" ? "text-[#ccff00]" : "text-white/40"}`}
         >
           <Flame className="w-5 h-5 text-current" />
           <span className="text-[9px] font-mono font-bold uppercase">RAG</span>
+        </button>
+        <button
+          onClick={() => setActiveTab("api-access")}
+          className={`flex flex-col items-center gap-1 ${activeTab === "api-access" ? "text-[#ccff00]" : "text-white/40"}`}
+        >
+          <Zap className="w-5 h-5" />
+          <span className="text-[9px] font-mono font-bold uppercase">API</span>
         </button>
       </nav>
 
@@ -2332,9 +2891,16 @@ export default function App() {
                     onChange={e => setPipelineForm(f => ({ ...f, generationModel: e.target.value }))}
                     className="w-full p-3 bg-black/60 border border-white/10 rounded text-xs font-semibold text-white outline-none focus:ring-1 focus:ring-[#ccff00] cursor-pointer"
                   >
-                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
-                    <option value="gemini-1.5-pro">gemini-1.5-pro</option>
-                    <option value="offline">offline (retrieval only)</option>
+                    <optgroup label="☁️ Gemini Cloud">
+                      <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                      <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+                    </optgroup>
+                    <optgroup label="🦙 Ollama Local">
+                      <option value="ollama:bjoernb/gemma4-e4b-think:latest">gemma4-e4b-think (local)</option>
+                    </optgroup>
+                    <optgroup label="⚙️ Other">
+                      <option value="offline">offline (retrieval only)</option>
+                    </optgroup>
                   </select>
                 </div>
 
