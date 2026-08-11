@@ -35,7 +35,7 @@ src/retrieval.ts         # chunkText + 检索核心 retrieveCore
 src/db.ts                # 表结构 + 持久化（扩展字段、幂等迁移）
 src/embeddings.ts        # 不变（Ollama qwen3-embedding:4b）
 src/routes/sources.ts    # 文档 CRUD + 分享开关 + parse-pdf + 内部 /api/retrieve
-src/routes/agent.ts      # API key 管理 + /api/agent/retrieve + /api/agent/sources
+src/routes/agent.ts      # API key 管理（dashboard 内部）+ /api/agent/retrieve（唯一对外端点）
 src/routes/system.ts     # health / config / stats / logs / users
 src/types.ts             # 精简类型（删 Pipeline 等）
 ```
@@ -177,7 +177,8 @@ LIMIT $k
 
 过滤器叠加顺序：`可见性 ∩ key.sourceFilter ∩ 请求 sourceFilter`。
 
-**GET `/api/agent/sources`**：key 归属用户可见文档 ∩ key.sourceFilter，字段 `{ id, name, type, vectorsCount, lastSync, isShared, ownerName }`。
+> 2026-08-11 决策补充：对外 API 面收敛为**仅 `POST /api/agent/retrieve`** 一个端点。
+> `GET /api/agent/sources` 已移除；key 管理仅作为 dashboard 内部接口存在，不出现在 OpenAPI 中。
 
 **Key 管理**（当前用户，无 ADMIN_SECRET）：
 - `GET /api/agent/keys` / `POST /api/agent/keys` / `PATCH /api/agent/keys/:id` / `DELETE /api/agent/keys/:id`

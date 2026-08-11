@@ -202,6 +202,13 @@ export function createSourcesRouter(): Router {
     try { await deleteChunksBySource(req.params.id); } catch (err) {
       console.warn("[reindex] pgvector cleanup failed:", err);
     }
+    // Persist the in-flight status so a crash/restart mid-embed can be
+    // detected and healed at next startup (see initializeState).
+    await upsertSource({
+      id: doc.id, name: doc.name, type: doc.type, status: "Syncing...", lastSync: doc.lastSync,
+      vectorsCount: doc.vectorsCount, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
+      isShared: doc.isShared, content: doc.content,
+    });
     send("start", { doc: { ...doc, chunks: [] }, total: rawChunks.length });
 
     try {

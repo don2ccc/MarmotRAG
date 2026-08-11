@@ -13,7 +13,7 @@
 1. **T1 类型层**：重写 `src/types.ts`（删 Pipeline/PipelineStats；SourceDoc 加 ownerId/isShared；QueryLog 简化；AgentApiKey 去 pipelineId 加 ownerId；StrategyConfig 精简）。
 2. **T2 数据层**：重写 `src/db.ts`（幂等迁移；sources/agent_keys/query_logs 新字段；删 pipelines 表；searchChunks 带可见性 JOIN）。
 3. **T3 新增模块**：`src/store.ts`（内存状态单例）、`src/auth.ts`（resolveUser + agentAuth）、`src/retrieval.ts`（chunkText + retrieveCore）。
-4. **T4 路由**：`src/routes/sources.ts`、`src/routes/agent.ts`、`src/routes/system.ts`。
+4. **T4 路由**：`src/routes/sources.ts`、`src/routes/agent.ts`（对外仅 `/agent/retrieve`）、`src/routes/system.ts`。
 5. **T5 后端瘦身**：重写 `server.ts`（挂载路由；删生成/pipeline/providers/SSO/openapi 旧内容；种子与新形状对齐；启动流程）。
 6. **T6 前端基础**：`src/api.ts`（X-User-Id fetch 封装）、`src/components/UserSwitcher.tsx`、`src/tabs/*.tsx` 拆分。
 7. **T7 前端功能**：App.tsx 删生成/pipeline/provider/SSO UI；知识库共享开关；检索实验室；API Access 只留 retrieve；Dashboard 简化。

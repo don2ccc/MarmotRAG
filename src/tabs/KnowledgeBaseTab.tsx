@@ -281,6 +281,17 @@ export default function KnowledgeBaseTab(props: Props) {
         </div>
       </div>
 
+      {filtered.some(s => s.status === "Paused") && (
+        <div className="flex items-center gap-2.5 bg-yellow-500/10 border border-yellow-500/25 rounded-xl px-4 py-3">
+          <AlertTriangle className="w-4 h-4 text-yellow-400 shrink-0" />
+          <p className="text-[11px] text-white/70 leading-relaxed">
+            <span className="font-bold text-yellow-300">{filtered.filter(s => s.status === "Paused").length}</span>
+            {" "}个文档处于 <span className="font-mono text-yellow-300">Paused</span> 状态（向量化中断或待处理）。
+            Owner 可在行内点 <span className="font-mono text-[#86C9A4] font-bold">Re-sync</span> 重新索引，或直接删除。
+          </p>
+        </div>
+      )}
+
       <div className="bg-[#131720] border border-white/10 rounded-xl overflow-hidden">
         {filtered.length === 0 ? (
           <p className="text-center py-12 text-xs font-mono text-white/45">No documents. Add your first one above.</p>
@@ -366,6 +377,17 @@ export default function KnowledgeBaseTab(props: Props) {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-0.5">
+                        {isOwner && s.status === "Paused" && (
+                          <button
+                            onClick={() => reindex(s.id)}
+                            disabled={!!indexingProgress[s.id]}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 mr-1 rounded border border-[#86C9A4]/30 text-[#86C9A4] hover:bg-[#86C9A4]/10 text-[10px] font-mono font-bold uppercase tracking-wider transition-colors cursor-pointer disabled:opacity-50"
+                            title="Re-embed chunks and restore this document"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${indexingProgress[s.id] ? "animate-spin" : ""}`} />
+                            <span>{indexingProgress[s.id] ? "Syncing…" : "Re-sync"}</span>
+                          </button>
+                        )}
                         <button onClick={() => openPreview(s.id)} className="p-1.5 text-white/55 hover:text-[#86C9A4] cursor-pointer" title="Preview chunks">
                           <Eye className="w-4 h-4" />
                         </button>
@@ -378,16 +400,25 @@ export default function KnowledgeBaseTab(props: Props) {
                             >
                               <Pencil className="w-4 h-4" />
                             </button>
-                            <button onClick={() => reindex(s.id)} className="p-1.5 text-white/55 hover:text-[#86C9A4] cursor-pointer" title="Re-index">
-                              <RefreshCw className="w-4 h-4" />
-                            </button>
-                            <button onClick={() => toggleStatus(s)} className="p-1.5 text-white/55 hover:text-yellow-400 cursor-pointer" title={s.status === "Paused" ? "Resume" : "Pause"}>
-                              {s.status === "Paused" ? <Eye className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
-                            </button>
+                            {s.status !== "Paused" && (
+                              <>
+                                <button onClick={() => reindex(s.id)} className="p-1.5 text-white/55 hover:text-[#86C9A4] cursor-pointer" title="Re-index">
+                                  <RefreshCw className="w-4 h-4" />
+                                </button>
+                                <button onClick={() => toggleStatus(s)} className="p-1.5 text-white/55 hover:text-yellow-400 cursor-pointer" title="Pause">
+                                  <AlertTriangle className="w-4 h-4" />
+                                </button>
+                              </>
+                            )}
                             <button onClick={() => deleteSource(s.id)} className="p-1.5 text-white/55 hover:text-red-400 cursor-pointer" title="Delete">
                               <Trash2 className="w-4 h-4" />
                             </button>
                           </>
+                        )}
+                        {!isOwner && s.status === "Paused" && (
+                          <span className="font-mono text-[9px] text-white/45 uppercase tracking-wider" title="Only the owner can re-sync or delete this document">
+                            等待所有者处理
+                          </span>
                         )}
                       </div>
                     </td>

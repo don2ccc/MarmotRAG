@@ -107,6 +107,45 @@ body.theme-light ::-webkit-scrollbar-thumb:hover {
 .theme-light .text-white\/55 {
   color: #475569 !important;
 }
+.theme-light .text-\[\#f0f0f0\] {
+  color: #0f172a !important;
+}
+
+/* Translucent dark surfaces (mobile header / bottom nav) */
+.theme-light .bg-\[\#0F1216\]\/95 {
+  background-color: rgba(255, 255, 255, 0.92) !important;
+}
+
+/* Semantic status colors for light mode */
+.theme-light .text-yellow-300 {
+  color: #b45309 !important;
+}
+.theme-light .text-yellow-400 {
+  color: #d97706 !important;
+}
+.theme-light .bg-yellow-500\/10 {
+  background-color: rgba(180, 83, 9, 0.1) !important;
+}
+.theme-light .border-yellow-500\/25 {
+  border-color: rgba(180, 83, 9, 0.25) !important;
+}
+.theme-light .text-blue-400 {
+  color: #1d4ed8 !important;
+}
+.theme-light .bg-blue-500\/15 {
+  background-color: rgba(29, 78, 216, 0.12) !important;
+}
+.theme-light .text-red-400 {
+  color: #dc2626 !important;
+}
+.theme-light .bg-red-500\/15 {
+  background-color: rgba(220, 38, 38, 0.12) !important;
+}
+
+/* Accent border opacity variants */
+.theme-light .border-\[\#86C9A4\]\/40 {
+  border-color: rgba(79, 70, 229, 0.35) !important;
+}
 .theme-light .bg-white\/5 {
   background-color: rgba(15, 23, 42, 0.04) !important;
 }

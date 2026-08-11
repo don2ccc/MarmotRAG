@@ -17,11 +17,12 @@ function generateApiKey(): string {
   return `mrmk_${hex}`;
 }
 
-/** Mask an API key: show prefix + last 4 chars only. */
-function maskKey(key: string): string {
-  const parts = key.split("_");
-  const prefix = parts.slice(0, 2).join("_");
-  return `${prefix}_****...****${key.slice(-4)}`;
+/**
+ * Mask an API key for display: keep "mrmk_" + first 6 chars + last 4.
+ * e.g. mrmk_de3502d979...1f9e → mrmk_de3502****1f9e
+ */
+export function maskKey(key: string): string {
+  return key.length > 14 ? `${key.slice(0, 11)}****${key.slice(-4)}` : key;
 }
 
 function toPublic(k: AgentApiKey) {
@@ -99,21 +100,6 @@ export function createAgentRouter(): Router {
     store.agentKeys = store.agentKeys.filter(k => k.id !== req.params.id);
     await deleteAgentKeyById(req.params.id);
     res.json({ message: "Key revoked" });
-  });
-
-  // ── Agent: list sources the key may query ────────────────────────────
-  r.get("/agent/sources", agentAuth, (req, res) => {
-    const key = (req as any).agentKey as AgentApiKey;
-    const allowed = store.sources.filter(s =>
-      (s.ownerId === key.ownerId || s.isShared) &&
-      (key.sourceFilter.length === 0 || key.sourceFilter.includes(s.id))
-    );
-    res.json({
-      sources: allowed.map(s => ({
-        id: s.id, name: s.name, type: s.type, vectorsCount: s.vectorsCount,
-        lastSync: s.lastSync, isShared: s.isShared, ownerName: s.ownerName,
-      })),
-    });
   });
 
   // ── Agent: retrieve chunks (the core API) ────────────────────────────

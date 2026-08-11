@@ -6,7 +6,7 @@ import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import {
-  initDb, upsertChunk, upsertSource, loadSources, countSources, countChunks,
+  initDb, upsertChunk, upsertSource, loadSources, countSources, countChunks, deleteChunksBySource,
   loadConfig, saveConfig,
   loadAgentKeys, upsertAgentKey, countAgentKeys,
   loadQueryLogs, insertQueryLog, queryLogsPaginated,
@@ -17,7 +17,7 @@ import { chunkText } from "./src/retrieval.js";
 import { createResolveUser } from "./src/auth.js";
 import { store } from "./src/store.js";
 import { createSourcesRouter } from "./src/routes/sources.js";
-import { createAgentRouter } from "./src/routes/agent.js";
+import { createAgentRouter, maskKey } from "./src/routes/agent.js";
 import { createSystemRouter } from "./src/routes/system.js";
 import type { AgentApiKey, QueryLog, SourceDoc } from "./src/types.js";
 
@@ -250,6 +250,28 @@ async function initializeState(): Promise<void> {
   });
   console.log(`[sources] Loaded ${store.sources.length} source(s) from DB`);
 
+  // Heal interrupted indexing jobs: a "Syncing..." status at boot means the
+  // previous process died mid-embed (e.g. server restart). Mark the source
+  // Paused, drop its partial chunks and zero the vector count so the user
+  // can re-index cleanly instead of seeing a permanently stuck status.
+  const interrupted = store.sources.filter(s => s.status === "Syncing...");
+  for (const doc of interrupted) {
+    console.warn(`[sources] Healed interrupted indexing for "${doc.name}" (${doc.id}) — marked Paused, partial chunks dropped`);
+    doc.status = "Paused";
+    doc.vectorsCount = 0;
+    try { await deleteChunksBySource(doc.id); } catch (err) {
+      console.warn(`[sources] Failed to clean partial chunks for ${doc.id}:`, err);
+    }
+    await upsertSource({
+      id: doc.id, name: doc.name, type: doc.type, status: "Paused", lastSync: doc.lastSync,
+      vectorsCount: 0, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
+      isShared: doc.isShared, content: doc.content,
+    });
+  }
+  if (interrupted.length > 0) {
+    console.log(`[sources] Healed ${interrupted.length} interrupted indexing job(s)`);
+  }
+
   // If marmot_chunks is empty but we have synced sources, mark them for reindex.
   const chunkTotal = await countChunks();
   if (chunkTotal === 0 && store.sources.length > 0) {
@@ -286,7 +308,7 @@ async function initializeState(): Promise<void> {
     console.log("[agent-keys] Seeded demo key to DB");
   }
   const dbKeys = await loadAgentKeys();
-  store.agentKeys = dbKeys.map(k => ({ ...k, _monthStamp: k.monthStamp }));
+  store.agentKeys = dbKeys.map(k => ({ ...k, keyPreview: maskKey(k.key), _monthStamp: k.monthStamp }));
   console.log(`[agent-keys] Loaded ${store.agentKeys.length} key(s) from DB`);
 
   // Query logs
@@ -302,41 +324,26 @@ async function initializeState(): Promise<void> {
   console.log(`[query-logs] Loaded ${store.queryLogs.length} recent log(s) from DB`);
 }
 
-// ── Compact OpenAPI for the retrieval-only surface ───────────────────────
+// ── OpenAPI: the ONLY public endpoint is agent chunk retrieval ──────────
 const OPENAPI = {
   openapi: "3.0.3",
   info: {
     title: "Marmot RAG Retrieval API",
     version: "1.0.0",
-    description: "Multi-user, shareable knowledge retrieval. Authenticate agent calls with X-API-Key; dashboard calls use X-User-Id (demo mode).",
+    description: "Retrieve relevant chunks from a shared knowledge base. Authenticate with X-API-Key.",
   },
   paths: {
-    "/api/health": { get: { summary: "System health", responses: { "200": { description: "OK" } } } },
-    "/api/sources": {
-      get: { summary: "List visible sources", responses: { "200": { description: "Sources visible to current user" } } },
-      post: { summary: "Add a document (SSE progress)", responses: { "200": { description: "SSE stream" } } },
-    },
-    "/api/retrieve": {
-      post: {
-        summary: "Retrieve chunks (dashboard, X-User-Id)",
-        requestBody: { content: { "application/json": { schema: { type: "object", properties: { query: { type: "string" }, topK: { type: "number" }, minScore: { type: "number" }, sourceFilter: { type: "array", items: { type: "string" } } } } } } },
-        responses: { "200": { description: "Chunks with scores" } },
-      },
-    },
-    "/api/agent/sources": {
-      get: { summary: "List sources the API key may query", security: [{ ApiKeyAuth: [] }], responses: { "200": { description: "Visible sources" } } },
-    },
     "/api/agent/retrieve": {
       post: {
-        summary: "Retrieve chunks (X-API-Key)",
+        summary: "Retrieve relevant chunks for a query",
         security: [{ ApiKeyAuth: [] }],
         requestBody: { content: { "application/json": { schema: { type: "object", properties: { query: { type: "string" }, topK: { type: "number" }, minScore: { type: "number" }, sourceFilter: { type: "array", items: { type: "string" } } } } } } },
-        responses: { "200": { description: "Chunks with scores" } },
+        responses: {
+          "200": { description: "Chunks with scores" },
+          "401": { description: "Missing or invalid X-API-Key" },
+          "429": { description: "Rate limit exceeded" },
+        },
       },
-    },
-    "/api/agent/keys": {
-      get: { summary: "List own API keys", responses: { "200": { description: "Keys" } } },
-      post: { summary: "Create API key", responses: { "201": { description: "Created (full key returned once)" } } },
     },
   },
   components: {
@@ -359,16 +366,12 @@ app.get("/api/docs", (_req, res) => {
 <body style="font-family:system-ui;max-width:720px;margin:40px auto">
 <h1>Marmot RAG — Retrieval API</h1>
 <p>OpenAPI: <a href="/api/openapi.json">/api/openapi.json</a></p>
-<h2>Agent endpoints (X-API-Key)</h2>
-<ul>
-<li><code>POST /api/agent/retrieve</code> — query → chunks (chunkId, sourceName, text, score, tokenCount) + context</li>
-<li><code>GET /api/agent/sources</code> — sources the key may query</li>
-</ul>
-<h2>Key management (dashboard)</h2>
-<ul>
-<li><code>GET|POST /api/agent/keys</code> — list / create own keys</li>
-<li><code>PATCH|DELETE /api/agent/keys/:id</code> — update / revoke</li>
-</ul>
+<p>The only public endpoint:</p>
+<pre><code>POST /api/agent/retrieve
+X-API-Key: mrmk_...
+
+{ "query": "...", "topK": 5, "minScore": 0.3 }
+</code></pre>
 </body></html>`);
 });
 
@@ -419,14 +422,6 @@ async function startServer() {
 
   const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[server] Listening on port ${PORT}`);
-  });
-
-  // API versioning stub — /api/v1/* mirrors /api/*
-  app.all("/api/v1/*", (req, res) => {
-    req.url = req.url.replace(/^\/api\/v1/, "/api");
-    app._router.handle(req, res, () => {
-      if (!res.headersSent) res.status(404).json({ error: "Not found" });
-    });
   });
 
   // Graceful shutdown

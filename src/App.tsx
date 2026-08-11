@@ -24,7 +24,7 @@ const NAV: { tab: TabType; label: string; icon: React.ComponentType<{ className?
 ];
 
 export default function App() {
-  const [themeMode, setThemeMode] = useState<"light" | "dark">("dark");
+  const [themeMode, setThemeMode] = useState<"light" | "dark">("light");
   const [activeTab, setActiveTab] = useState<TabType>("dashboard");
   const [users, setUsers] = useState<UserInfo[]>([]);
   const [currentUserId, setCurrentUserId] = useState("u-1");
@@ -132,7 +132,7 @@ export default function App() {
             initial={{ opacity: 0, y: -20, scale: 0.95 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -20, scale: 0.95 }}
-            className={`fixed top-4 right-4 z-50 p-4 rounded border flex items-start gap-3 max-w-sm shadow-xl ${
+            className={`fixed bottom-6 right-6 z-[90] pointer-events-none max-w-[calc(100vw-2rem)] p-4 rounded border flex items-start gap-3 shadow-xl ${
               toast.type === "success" ? "bg-black border-[#86C9A4] text-white" :
               toast.type === "error" ? "bg-black border-red-500 text-white" :
               "bg-black border-white/20 text-white"
@@ -149,7 +149,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* Sidebar */}
-      <aside className="hidden md:flex flex-col h-screen py-6 px-4 gap-6 border-r border-white/10 bg-[#0F1216] w-64 fixed left-0 top-0 z-20">
+      <aside className="hidden md:flex flex-col h-dvh py-6 px-4 gap-6 border-r border-white/10 bg-[#0F1216] w-64 fixed left-0 top-0 z-20">
         <div className="flex items-center gap-3 px-1 mb-1">
           <div className="w-9 h-9 bg-[#86C9A4] rounded-full flex items-center justify-center shrink-0">
             <span className="font-display text-sm font-extrabold text-black uppercase tracking-tighter">M</span>
@@ -197,7 +197,7 @@ export default function App() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 md:ml-64 pb-20 md:pb-0">
+      <main className="flex-1 md:ml-64 pb-24 md:pb-0">
         {/* Mobile header */}
         <div className="md:hidden sticky top-0 z-20 bg-[#0F1216]/95 backdrop-blur border-b border-white/10 px-4 py-3 flex items-center gap-3">
           <div className="w-8 h-8 bg-[#86C9A4] rounded-full flex items-center justify-center shrink-0">
@@ -233,7 +233,7 @@ export default function App() {
       </main>
 
       {/* Mobile bottom nav */}
-      <nav className="md:hidden fixed bottom-0 inset-x-0 z-20 bg-[#0F1216]/95 backdrop-blur border-t border-white/10 flex">
+      <nav className="md:hidden fixed bottom-0 inset-x-0 z-20 bg-[#0F1216]/95 backdrop-blur border-t border-white/10 flex pb-[env(safe-area-inset-bottom)]">
         {NAV.slice(0, 5).map(({ tab, label, icon: Icon }) => (
           <button
             key={tab}

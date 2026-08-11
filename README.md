@@ -140,7 +140,7 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 
 ### 8.2 Agent API (external, `X-API-Key`)
 
-**`POST /api/agent/retrieve`** — the core endpoint:
+**The only public endpoint is `POST /api/agent/retrieve`** — everything else in the system is dashboard-internal and not exposed to external callers.
 
 ```bash
 curl -X POST http://localhost:3000/api/agent/retrieve \
@@ -168,8 +168,6 @@ Response:
   "latencyMs": 245
 }
 ```
-
-**`GET /api/agent/sources`** — sources the key may query (id, name, type, vectorsCount, lastSync, isShared, ownerName).
 
 **Scoping:** a key can only retrieve from its owner's documents plus platform-shared documents, intersected with the key's `sourceFilter`. Keys are rate-limited per minute; usage is counted and logged under the owning user.
 
