@@ -40,16 +40,16 @@ function sanitizeForEmbed(text: string): string {
 }
 
 /**
- * Embed a single text string using Ollama.
- * Returns a 768-dimensional number array.
- * Throws on network / model error — callers should catch and handle.
+ * Embed a single text string using Ollama — low-level, no retry.
+ * Throws on network / model error.
  */
-export async function embedText(text: string): Promise<number[]> {
+async function embedTextOnce(text: string): Promise<number[]> {
   const clean = sanitizeForEmbed(text);
   const response = await fetch(`${OLLAMA_BASE_URL}/api/embeddings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: EMBED_MODEL, prompt: clean }),
+    signal: AbortSignal.timeout(30_000), // 30s timeout per chunk
   });
 
   if (!response.ok) {
@@ -64,13 +64,50 @@ export async function embedText(text: string): Promise<number[]> {
 }
 
 /**
- * Embed multiple texts in sequence (Ollama does not batch natively).
- * Returns an array of embeddings in the same order as the input.
+ * Embed a single text with exponential-backoff retry (up to 3 attempts).
+ * Retry delays: 1s → 2s → 4s.
+ * Use this for all production embedding calls.
  */
-export async function embedTexts(texts: string[]): Promise<number[][]> {
-  const results: number[][] = [];
-  for (const text of texts) {
-    results.push(await embedText(text));
+export async function embedText(text: string, maxRetries = 3): Promise<number[]> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await embedTextOnce(text);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries - 1) {
+        const delayMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+        console.warn(`[embed] attempt ${attempt + 1} failed, retrying in ${delayMs}ms: ${err}`);
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
   }
-  return results;
+  throw lastErr;
+}
+
+/**
+ * Embed multiple texts with bounded concurrency (default: 3 at a time).
+ * Returns an array of embeddings in the same order as the input.
+ * Each embed uses retry logic via embedText().
+ */
+export async function embedTexts(texts: string[], concurrency = 3): Promise<number[][]> {
+  const results: (number[] | null)[] = new Array(texts.length).fill(null);
+  let idx = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = idx++;
+      if (i >= texts.length) break;
+      results[i] = await embedText(texts[i]);
+    }
+  }
+
+  // Spin up `concurrency` workers
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(concurrency, texts.length); w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  return results as number[][];
 }

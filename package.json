@@ -4,20 +4,24 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "node -e \"require('fs').rmSync('node_modules/.vite',{recursive:true,force:true})\" && tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
-    "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "lint": "tsc --noEmit",
+    "test": "node scripts/test-retrieval.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "helmet": "^8.3.0",
     "jieba-wasm": "^2.4.0",
     "lucide-react": "^0.546.0",
+    "morgan": "^1.11.0",
     "motion": "^12.23.24",
     "pdf-parse": "1.1.1",
     "pg": "^8.13.3",
@@ -27,7 +31,9 @@
     "vite": "^6.2.3"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
+    "@types/morgan": "^1.9.10",
     "@types/node": "^22.14.0",
     "@types/pdf-parse": "^1.1.5",
     "@types/pg": "^8.20.0",

@@ -14,23 +14,26 @@ export interface SourceDoc {
   status: "Synced" | "Syncing..." | "Paused" | "Auth Error";
   lastSync: string;
   vectorsCount: number;
-  owner: string;
-  ownerAvatar?: string;
+  ownerId: string;
+  ownerName: string;
+  isShared: boolean;
   content: string;
   chunks: Chunk[];
 }
 
+/** Query log — retrieval only (no answer, no scores). */
 export interface QueryLog {
   id: string;
+  /** ISO 8601 full datetime string, e.g. "2025-01-15T14:22:18.000Z" */
   timestamp: string;
   query: string;
-  pipeline: string;
-  answer: string;
-  faithfulnessScore: number;
-  relevanceScore: number;
+  /** Owner of the log entry (dashboard user or agent key owner). */
+  userId: string;
+  /** "user" for playground queries, "agent:<label>" for API key calls. */
+  via: string;
   latencyMs: number;
-  status: "success" | "warning" | "error";
-  retrievedChunks: { text: string; sourceName: string; score: number }[];
+  status: "success" | "error";
+  retrievedChunks: { chunkId: string; sourceName: string; text: string; score: number }[];
 }
 
 export interface StrategyConfig {
@@ -47,64 +50,84 @@ export interface StrategyConfig {
   embeddingModel: string;
   embeddingDimension: number;
   ollamaBaseUrl: string;
-  // Auth & providers
-  ssoEnabled: boolean;
-  providerList: { name: string; active: boolean; model: string; status: string }[];
-  // Optional external / cloud vector DB (reserved for future integration)
-  externalVectorDb: {
-    enabled: boolean;
-    provider: string;         // e.g. "Pinecone" | "Weaviate" | "Qdrant" | "Milvus" | "Custom"
-    apiEndpoint: string;
-    apiKey: string;
-    indexName: string;
-    notes: string;
-  };
 }
 
 export type TabType = "workspace" | "knowledge-base" | "admin" | "dashboard" | "playground" | "api-access";
 
-/** An API Key issued to an external AI Agent / integration. */
-export interface AgentApiKey {
+/**
+ * Safe public representation of an Agent API Key — no secret, no internal fields.
+ */
+export interface AgentApiKeyPublic {
   id: string;
-  label: string;             // human-readable name, e.g. "LangChain Bot - Prod"
-  key: string;               // the actual secret: "mrmk_<hex>" — shown once on creation
-  keyPreview: string;        // masked version: "mrmk_****...****ab12" — always shown
-  pipelineId: string | null; // null = caller may choose at query time
-  sourceFilter: string[];    // [] = all sources, otherwise restrict retrieval
+  label: string;
+  keyPreview: string;
+  sourceFilter: string[];    // [] = all visible sources, otherwise restrict retrieval
   rateLimit: number;         // max requests per minute (0 = unlimited)
   enabled: boolean;
   createdAt: string;
   lastUsedAt: string | null;
-  usageCount: number;        // total calls served
-  usageThisMonth: number;    // calls in current calendar month
+  usageCount: number;
+  usageThisMonth: number;
 }
 
-/** A named RAG pipeline configuration. */
-export interface Pipeline {
-  id: string;
-  name: string;
-  description: string;
-  generationModel: string;   // e.g. "gemini-3.5-flash" | "gemini-1.5-pro" | "offline"
-  topK: number;              // how many chunks to retrieve (1-10)
-  minScore: number;          // minimum cosine similarity threshold (0-1)
-  systemPrompt: string;      // custom system instruction (empty = use default)
-  sourceFilter: string[];    // source doc IDs to restrict retrieval (empty = all)
-  enabled: boolean;
-  createdAt: string;
+/** Response returned ONCE when a new key is created — full plaintext secret. */
+export interface AgentApiKeyCreated extends AgentApiKeyPublic {
+  key: string;
 }
 
-/** Aggregated live metrics for a Pipeline, computed from QueryLogs. */
-export interface PipelineStats {
-  pipelineId: string;
-  queryCount: number;
-  avgLatencyMs: number;
-  avgFaithfulness: number;
-  avgRelevance: number;
-  lastUsed: string | null;
+/** Full server-side record including internal tracking fields. */
+export interface AgentApiKey extends AgentApiKeyPublic {
+  ownerId: string;           // owning user id
+  key: string;
+  _monthStamp: string;       // "YYYY-MM" for monthly usage reset — internal only
 }
 
 /** Live indexing progress attached to a SourceDoc while embedding is running. */
 export interface IndexingProgress {
   done: number;
   total: number;
+}
+
+/** Demo user shown in the switcher (mirrors marmot_users rows). */
+export interface UserInfo {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  lastLogin: string;
+}
+
+/** GET /api/health response. */
+export interface HealthStatus {
+  status: string;
+  pgConnected: boolean;
+  ollamaConnected: boolean;
+  pgHost: string;
+  pgDatabase: string;
+  ollamaBaseUrl: string;
+}
+
+/** GET /api/stats response. */
+export interface SystemStats {
+  totalVectors: number;
+  activeSourceCount: number;
+  syncedSourceCount: number;
+  ownSources: number;
+  queryCount: number;
+  avgLatencyMs: number;
+}
+
+/** POST /api/retrieve or /api/agent/retrieve response. */
+export interface RetrieveResult {
+  query: string;
+  chunks: {
+    chunkId: string;
+    sourceId: string;
+    sourceName: string;
+    text: string;
+    score: number;
+    tokenCount: number;
+  }[];
+  context: string;
+  latencyMs: number;
 }

@@ -1,83 +1,57 @@
 import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import morgan from "morgan";
 import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
-import { initDb, upsertChunk, searchChunks, deleteChunksBySource, upsertSource, loadSources, deleteSource, countSources, countChunks } from "./src/db.js";
+import {
+  initDb, upsertChunk, upsertSource, loadSources, countSources, countChunks,
+  loadConfig, saveConfig,
+  loadAgentKeys, upsertAgentKey, countAgentKeys,
+  loadQueryLogs, insertQueryLog, queryLogsPaginated,
+  loadUsers, upsertUser, countUsers, closePool,
+} from "./src/db.js";
 import { embedText } from "./src/embeddings.js";
-// CJS modules — loaded via createRequire (ESM project)
-import { createRequire } from "module";
-const _require = createRequire(import.meta.url);
-const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = _require("pdf-parse");
-// jieba-wasm: CJK-aware tokenizer (Rust/WASM, no native build needed)
-const jieba = _require("jieba-wasm") as { cut: (text: string, hmm: boolean) => string[] };
+import { chunkText } from "./src/retrieval.js";
+import { createResolveUser } from "./src/auth.js";
+import { store } from "./src/store.js";
+import { createSourcesRouter } from "./src/routes/sources.js";
+import { createAgentRouter } from "./src/routes/agent.js";
+import { createSystemRouter } from "./src/routes/system.js";
+import type { AgentApiKey, QueryLog, SourceDoc } from "./src/types.js";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: "50mb" }));
+// ── Security & CORS middleware ──────────────────────────────────────────
+const rawOrigins = process.env.CORS_ORIGINS || "*";
+const corsOrigins = rawOrigins === "*" ? "*" : rawOrigins.split(",").map(o => o.trim());
+app.use(cors({
+  origin: corsOrigins,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-API-Key", "X-User-Id"],
+}));
 
-// Lazy-loaded Gemini AI client to handle missing keys gracefully on startup
-let aiClient: GoogleGenAI | null = null;
-function getAI(): GoogleGenAI | null {
-  if (!aiClient) {
-    const key = process.env.GEMINI_API_KEY;
-    if (key && key !== "MY_GEMINI_API_KEY") {
-      aiClient = new GoogleGenAI({
-        apiKey: key,
-        httpOptions: {
-          headers: {
-            "User-Agent": "aistudio-build",
-          },
-        },
-      });
-    }
-  }
-  return aiClient;
-}
+// Disable helmet's contentSecurityPolicy in dev (Vite uses inline scripts)
+app.use(helmet({
+  contentSecurityPolicy: process.env.NODE_ENV === "production",
+  crossOriginEmbedderPolicy: false,
+}));
 
-// In-Memory Data Store for RAG System
-interface Chunk {
-  id: string;
-  sourceId: string;
-  sourceName: string;
-  text: string;
-  tokensCount: number;
-  embedding?: number[];
-}
+// 50MB limit for PDF uploads; all other JSON limited to 2MB
+app.use("/api/parse-pdf", express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-interface SourceDoc {
-  id: string;
-  name: string;
-  type: string; // PDF Collection, Notion Webhook, G-Drive Archive, HTML Document, etc.
-  status: "Synced" | "Syncing..." | "Paused" | "Auth Error";
-  lastSync: string;
-  vectorsCount: number;
-  owner: string;
-  ownerAvatar?: string;
-  content: string;
-  chunks: Chunk[];
-}
+// HTTP request logging — concise in dev, combined in production
+app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-interface QueryLog {
-  id: string;
-  timestamp: string;
-  query: string;
-  pipeline: string;
-  answer: string;
-  faithfulnessScore: number;
-  relevanceScore: number;
-  latencyMs: number;
-  status: "success" | "warning" | "error";
-  retrievedChunks: { text: string; sourceName: string; score: number }[];
-}
+// ── Demo identity: resolve X-User-Id → req.user (swap for session/JWT later) ──
+app.use(createResolveUser(() => store.users));
 
-// dataSources is populated from DB at startup by initializeSources()
-let dataSources: SourceDoc[] = [];
-
-// Seed documents — written to DB only when marmot_sources is empty (first run ever)
+// ── Seed documents — written to DB only when marmot_sources is empty ─────
 const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
   {
     id: "src-1",
@@ -85,9 +59,10 @@ const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
     type: "PDF Collection",
     status: "Synced",
     lastSync: "2 hours ago",
-    vectorsCount: 24510,
-    owner: "You",
-    ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCUZfI40ZWgWIDJa9qAzScBenlksgTyw_ZjF1AYj9rj4vCTl6wZxKDgFBZpZlSBlYev_bfIafWaYRsnrWPZBoAc0ZbuwqbkwPXveoPjiO_YWKUF0Y4kefUnFCO6PdAN3kzoe6izqFyK2vK5zfYVlcZPQJdAgJshkBloQ6ERj6IhwjyffFbxRfbjqH03mzWd_9zHkPUEefX1dr6O20QnzW3vjN2U23n40Nt2nVNcnYrymJjWwbdsGeaa",
+    vectorsCount: 0,
+    ownerId: "u-1",
+    ownerName: "Jane Doe",
+    isShared: false,
     content: "RAG Enterprise Financial Report for Q3 2026. Revenues increased by 15.4% quarter-over-quarter, reaching a historic high of $42.6 million. Operation costs were kept under control, decreasing overall system latency and optimizing API credit costs. Standard compliance was fully met across tier 3 data center regions.",
   },
   {
@@ -96,9 +71,10 @@ const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
     type: "Notion Webhook",
     status: "Synced",
     lastSync: "In progress",
-    vectorsCount: 102933,
-    owner: "You",
-    ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCUZfI40ZWgWIDJa9qAzScBenlksgTyw_ZjF1AYj9rj4vCTl6wZxKDgFBZpZlSBlYev_bfIafWaYRsnrWPZBoAc0ZbuwqbkwPXveoPjiO_YWKUF0Y4kefUnFCO6PdAN3kzoe6izqFyK2vK5zfYVlcZPQJdAgJshkBloQ6ERj6IhwjyffFbxRfbjqH03mzWd_9zHkPUEefX1dr6O20QnzW3vjN2U23n40Nt2nVNcnYrymJjWwbdsGeaa",
+    vectorsCount: 0,
+    ownerId: "u-1",
+    ownerName: "Jane Doe",
+    isShared: true,
     content: "Customer support rules require a Microsoft Entra or Okta Single Sign-On (SSO) for authentication. Secondary work policy states that employees must request written super-admin permission before taking on external development work to ensure there is no IP collision. Latency fallback mode switches automatically to the Azure AI Search vector database if primary Pinecone API response latency exceeds 500ms.",
   },
   {
@@ -107,9 +83,10 @@ const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
     type: "HTML Document",
     status: "Synced",
     lastSync: "10 mins ago",
-    vectorsCount: 1820,
-    owner: "Alex Rivera",
-    ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCB2V1AmGB2QbpzGRmdTc18v779hBGHKc1XGY8-Tpe7PrKvpkCdqOFrI1pw_sIYLXkPDjNchTSKlost7smglEjdkzy6No1nert4fbpnFrDfRqiO_tMkpJjEO2PzT8is4UvqykK3WS4i6GkycezERUIXIsjY9nR8zSPs5WHArO3G94M59wruvEas2lEFdmYnexWRGf70prB2z0tEmcjgXK5JNiXGZnuRm5cC3Qb6W6L1LcdXplXa3wE9",
+    vectorsCount: 0,
+    ownerId: "u-1",
+    ownerName: "Jane Doe",
+    isShared: true,
     content: `<h3>Enterprise Multi-Region Network Architecture</h3>
 <p>Our primary database cluster is distributed across multiple regions to ensure high availability. The connection topology and physical server layout is detailed in the diagram below:</p>
 <div class="image-container">
@@ -128,104 +105,132 @@ const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
     id: "src-3",
     name: "Legacy Product Manuals",
     type: "G-Drive Archive",
-    status: "Paused",
+    status: "Synced",
     lastSync: "3 days ago",
-    vectorsCount: 8244,
-    owner: "Sarah K.",
-    ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuD9HiY5NXFEBD_jBLR73RLjTyaUuFkDAGR3xP45-msTAdfseUcPIVX0SS4ejT1-XF2B_luIUE6VXsMGuS3H8DSPhjSJOGGsiluZx402_Z0BYp3hVYPxeAAMU0ijY_jHSqiS5TNzWVOU2pdDf4XaKCgb6RS5rpQsEnkH_QmFpPzOLPOtugVzF_Y5fAz5y3NHrjVH4B_EC1a0LlLRP2PNe4j_ayPjlsjDDo3V5vtPws9Awsjw3bAeJHma",
+    vectorsCount: 0,
+    ownerId: "u-2",
+    ownerName: "Marcus Kane",
+    isShared: false,
     content: "The original System-900 series utilizes fixed-size chunks of 256 tokens and 10% overlap. This legacy setting is now retired but documentation is kept for regulatory compliance. System-900 compliance rules dictate strict air-gapped deployments for public sector clients.",
   },
 ];
 
-/**
- * Count tokens in a text string using jieba for CJK content.
- * jieba.cut returns individual words/chars; filter out pure-whitespace tokens.
- * This gives accurate word counts for Chinese, Japanese, and mixed text.
- */
-function countTokens(text: string): number {
-  return jieba.cut(text, false).filter(t => t.trim().length > 0).length;
-}
+// ── Seed users ───────────────────────────────────────────────────────────
+const SEED_USERS = [
+  { id: "u-1", name: "Jane Doe",     email: "jane.doe@enterprise.ai",  role: "Super Admin", lastLogin: "2 mins ago" },
+  { id: "u-2", name: "Marcus Kane",  email: "m.kane@enterprise.ai",     role: "Developer",   lastLogin: "3 hours ago" },
+  { id: "u-3", name: "Sarah Lim",    email: "slim@enterprise.ai",        role: "Viewer",      lastLogin: "Yesterday" },
+];
 
-/**
- * Split text into chunks using jieba-aware token counting.
- * - "Semantic": sentence-boundary sliding window (CJK + Latin punctuation)
- * - "Fixed": sliding window by token count
- * - "Paragraph": split on blank lines, fallback to Fixed for long paragraphs
- *
- * `size` = max tokens per chunk (jieba tokens, ~1 CJK word each)
- * `overlap` = number of tokens to carry over between chunks
- */
-function chunkText(text: string, size: number, overlap: number, strategy: string): string[] {
-  const chunks: string[] = [];
-  const totalTokens = countTokens(text);
-
-  if (strategy === "Fixed" || totalTokens < size / 2) {
-    // Sliding window over jieba tokens
-    const tokens = jieba.cut(text, false).filter(t => t.trim().length > 0);
-    const stride = Math.max(1, size - overlap);
-    for (let i = 0; i < tokens.length; i += stride) {
-      const slice = tokens.slice(i, i + size);
-      if (slice.length > 0) chunks.push(slice.join(""));
-      if (i + size >= tokens.length) break;
-    }
-  } else if (strategy === "Semantic") {
-    // Split on CJK + Latin sentence boundaries
-    const sentences = text.match(/[^.!?。！？\n]+[.!?。！？\n]+/g) || [text];
-    let currentChunk: string[] = [];
-    let currentLen = 0;
-
-    for (const sentence of sentences) {
-      const sentenceLen = countTokens(sentence);
-      if (currentLen + sentenceLen > size && currentChunk.length > 0) {
-        chunks.push(currentChunk.join(""));
-        // Overlap: retain last `overlap` tokens worth of sentences
-        let overlapLen = 0;
-        const overlapChunk: string[] = [];
-        for (let j = currentChunk.length - 1; j >= 0; j--) {
-          const wc = countTokens(currentChunk[j]);
-          if (overlapLen + wc <= overlap) {
-            overlapChunk.unshift(currentChunk[j]);
-            overlapLen += wc;
-          } else break;
-        }
-        currentChunk = overlapChunk;
-        currentLen = overlapLen;
-      }
-      currentChunk.push(sentence.trim());
-      currentLen += sentenceLen;
-    }
-    if (currentChunk.length > 0) chunks.push(currentChunk.join(""));
-  } else {
-    // Paragraph strategy
-    const paragraphs = text.split(/\n\s*\n+/);
-    for (const para of paragraphs) {
-      if (countTokens(para) <= size) {
-        chunks.push(para.trim());
-      } else {
-        chunks.push(...chunkText(para, size, overlap, "Fixed"));
-      }
-    }
+// ── Seed query logs (retrieval only) ────────────────────────────────────
+const SEED_QUERY_LOGS: QueryLog[] = [
+  {
+    id: "log-1",
+    timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
+    query: "What are the compliance rules for Tier 3 data centers?",
+    userId: "u-1",
+    via: "user",
+    latencyMs: 182,
+    status: "success",
+    retrievedChunks: [
+      { chunkId: "src-2-chk-0", sourceName: "Customer Support Docs", text: "Standard compliance was fully met across tier 3 data center regions.", score: 0.95 }
+    ]
+  },
+  {
+    id: "log-2",
+    timestamp: new Date(Date.now() - 1000 * 60 * 7).toISOString(),
+    query: "Retrieve corporate regulations on secondary development work.",
+    userId: "u-1",
+    via: "user",
+    latencyMs: 315,
+    status: "success",
+    retrievedChunks: [
+      { chunkId: "src-2-chk-1", sourceName: "Customer Support Docs", text: "Secondary work policy states that employees must request written super-admin permission before taking on external development work to ensure there is no IP collision.", score: 0.88 }
+    ]
+  },
+  {
+    id: "log-3",
+    timestamp: new Date(Date.now() - 1000 * 60 * 9).toISOString(),
+    query: "Show me the distribution of our database cluster diagram.",
+    userId: "u-1",
+    via: "user",
+    latencyMs: 245,
+    status: "success",
+    retrievedChunks: [
+      { chunkId: "src-4-chk-0", sourceName: "Enterprise Network Topology", text: "Our primary database cluster is distributed across multiple regions.", score: 0.92 }
+    ]
   }
-  return chunks.filter(c => c.trim().length > 0);
-}
+];
+
+// ── Seed agent key (demo) ────────────────────────────────────────────────
+const SEED_AGENT_KEYS: AgentApiKey[] = [
+  {
+    id: "akey-1",
+    label: "Demo LangChain Agent",
+    key: "mrmk_demo_0000000000000000000000000000000000000000000000000000000000000000",
+    keyPreview: "mrmk_demo_****...****0000",
+    ownerId: "u-1",
+    sourceFilter: [],
+    rateLimit: 60,
+    enabled: true,
+    createdAt: new Date(Date.now() - 86400000 * 5).toISOString(),
+    lastUsedAt: new Date(Date.now() - 3600000).toISOString(),
+    usageCount: 0,
+    usageThisMonth: 0,
+    _monthStamp: new Date().toISOString().slice(0, 7),
+  },
+];
+
+// ── Default strategy config (chunking only) ──────────────────────────────
+const DEFAULT_STRATEGY_CONFIG = {
+  chunkSize: 200,
+  chunkOverlap: 20,
+  separationStrategy: "Semantic",
+  pgHost: process.env.PG_HOST || "127.0.0.1",
+  pgPort: process.env.PG_PORT || "5432",
+  pgDatabase: process.env.PG_DATABASE || "ai_hub",
+  pgTable: "marmot_chunks",
+  embeddingProvider: "Ollama (Local)",
+  embeddingModel: "qwen3-embedding:4b",
+  embeddingDimension: 2000,
+  ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+};
 
 /**
- * Load sources from DB into dataSources memory array.
- * On first run (empty table) write the seed documents and embed their chunks.
+ * Load all business state from DB into memory, seeding on first run.
+ * Called once after initDb() at startup.
  */
-async function initializeSources() {
+async function initializeState(): Promise<void> {
+  // Users first (ownerName resolution depends on them)
+  const userCount = await countUsers();
+  if (userCount === 0) {
+    for (const u of SEED_USERS) await upsertUser(u);
+    console.log("[users] Seeded default users to DB");
+  }
+  store.users = await loadUsers();
+  console.log(`[users] Loaded ${store.users.length} user(s) from DB`);
+
+  // Sources
   const existing = await countSources();
   if (existing === 0) {
     console.log("[sources] Empty DB — seeding initial documents...");
     for (const doc of SEED_SOURCES) {
-      await upsertSource({ ...doc, ownerAvatar: doc.ownerAvatar ?? "" });
+      const owner = store.users.find(u => u.id === doc.ownerId);
+      const ownerName = owner?.name ?? doc.ownerName;
+      await upsertSource({
+        id: doc.id, name: doc.name, type: doc.type, status: doc.status, lastSync: doc.lastSync,
+        vectorsCount: doc.vectorsCount, owner: ownerName, ownerAvatar: "",
+        ownerId: doc.ownerId, isShared: doc.isShared, content: doc.content,
+      });
       // Embed seed chunks
       const rawChunks = chunkText(doc.content, 120, 15, "Semantic");
       for (let idx = 0; idx < rawChunks.length; idx++) {
-        const text = rawChunks[idx];
         try {
-          const embedding = await embedText(text);
-          await upsertChunk({ id: `${doc.id}-chk-${idx}`, sourceId: doc.id, sourceName: doc.name, text, tokensCount: text.split(/\s+/).length, embedding });
+          const embedding = await embedText(rawChunks[idx]);
+          await upsertChunk({
+            id: `${doc.id}-chk-${idx}`, sourceId: doc.id, sourceName: doc.name,
+            text: rawChunks[idx], tokensCount: rawChunks[idx].split(/\s+/).length, embedding,
+          });
         } catch (err) {
           console.warn(`[seed] embed failed for ${doc.id}-chk-${idx}:`, err);
         }
@@ -233,1180 +238,171 @@ async function initializeSources() {
       console.log(`[seed] Embedded: ${doc.name}`);
     }
   }
-  // Always load from DB into memory; cast status string → union literal
   const rows = await loadSources();
-  dataSources = rows.map(r => ({
-    ...r,
-    status: r.status as SourceDoc["status"],
-    chunks: [],
-  }));
-  console.log(`[sources] Loaded ${dataSources.length} source(s) from DB`);
+  store.sources = rows.map(r => {
+    const owner = store.users.find(u => u.id === r.ownerId);
+    return {
+      ...r,
+      status: r.status as SourceDoc["status"],
+      ownerName: owner?.name ?? r.owner,
+      chunks: [],
+    };
+  });
+  console.log(`[sources] Loaded ${store.sources.length} source(s) from DB`);
 
-  // If marmot_chunks is empty but we have synced sources, the embedding model
-  // was changed (dimension migration). Mark those sources as needing reindex.
+  // If marmot_chunks is empty but we have synced sources, mark them for reindex.
   const chunkTotal = await countChunks();
-  if (chunkTotal === 0 && dataSources.length > 0) {
+  if (chunkTotal === 0 && store.sources.length > 0) {
     console.warn("[sources] marmot_chunks is empty — marking all sources as needing reindex");
-    for (const doc of dataSources) {
+    for (const doc of store.sources) {
       if (doc.status === "Synced") {
         doc.status = "Paused";
-        await upsertSource({ id: doc.id, name: doc.name, type: doc.type, status: "Paused", lastSync: doc.lastSync, vectorsCount: 0, owner: doc.owner, ownerAvatar: doc.ownerAvatar ?? "", content: doc.content });
+        await upsertSource({
+          id: doc.id, name: doc.name, type: doc.type, status: "Paused", lastSync: doc.lastSync,
+          vectorsCount: 0, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
+          isShared: doc.isShared, content: doc.content,
+        });
       }
     }
   }
+
+  // Strategy config
+  const savedCfg = await loadConfig();
+  if (savedCfg) {
+    store.strategyConfig = { ...DEFAULT_STRATEGY_CONFIG, ...savedCfg } as typeof DEFAULT_STRATEGY_CONFIG;
+    console.log("[config] Loaded strategy config from DB");
+  } else {
+    store.strategyConfig = { ...DEFAULT_STRATEGY_CONFIG };
+    await saveConfig(store.strategyConfig as unknown as Record<string, unknown>);
+    console.log("[config] Seeded default strategy config to DB");
+  }
+
+  // Agent keys
+  const keyCount = await countAgentKeys();
+  if (keyCount === 0) {
+    for (const k of SEED_AGENT_KEYS) {
+      await upsertAgentKey({ ...k, monthStamp: k._monthStamp });
+    }
+    console.log("[agent-keys] Seeded demo key to DB");
+  }
+  const dbKeys = await loadAgentKeys();
+  store.agentKeys = dbKeys.map(k => ({ ...k, _monthStamp: k.monthStamp }));
+  console.log(`[agent-keys] Loaded ${store.agentKeys.length} key(s) from DB`);
+
+  // Query logs
+  const { logs: existingLogs } = await queryLogsPaginated({ limit: 1, offset: 0 });
+  if (existingLogs.length === 0) {
+    for (const l of SEED_QUERY_LOGS) await insertQueryLog(l);
+    console.log("[query-logs] Seeded demo log(s) to DB");
+  }
+  store.queryLogs = (await loadQueryLogs(200)).map(l => ({
+    ...l,
+    status: l.status as QueryLog["status"],
+  }));
+  console.log(`[query-logs] Loaded ${store.queryLogs.length} recent log(s) from DB`);
 }
 
-// Strategy Config State
-let strategyConfig = {
-  chunkSize: 200,   // 200 jieba-tokens — safe for qwen3-embedding (32k ctx window)
-  chunkOverlap: 20,
-  separationStrategy: "Semantic",
-  // Vector store — actual local pgvector config (read from env)
-  pgHost: process.env.PG_HOST || "127.0.0.1",
-  pgPort: process.env.PG_PORT || "5432",
-  pgDatabase: process.env.PG_DATABASE || "ai_hub",
-  pgTable: "marmot_chunks",
-  // Embedding model — Ollama local
-  embeddingProvider: "Ollama (Local)",
-  embeddingModel: "qwen3-embedding:4b",
-  embeddingDimension: 2000,
-  ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
-  // Auth
-  ssoEnabled: true,
-  providerList: [
-    { name: "Ollama", active: true, model: "qwen3-embedding:4b", status: "Local" },
-    { name: "Gemini Generation", active: !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY", model: "gemini-3.5-flash", status: "Generation Only" }
-  ],
-  // Optional external / cloud vector DB — disabled by default
-  externalVectorDb: {
-    enabled: false,
-    provider: "Pinecone",
-    apiEndpoint: "",
-    apiKey: "",
-    indexName: "",
-    notes: "",
+// ── Compact OpenAPI for the retrieval-only surface ───────────────────────
+const OPENAPI = {
+  openapi: "3.0.3",
+  info: {
+    title: "Marmot RAG Retrieval API",
+    version: "1.0.0",
+    description: "Multi-user, shareable knowledge retrieval. Authenticate agent calls with X-API-Key; dashboard calls use X-User-Id (demo mode).",
+  },
+  paths: {
+    "/api/health": { get: { summary: "System health", responses: { "200": { description: "OK" } } } },
+    "/api/sources": {
+      get: { summary: "List visible sources", responses: { "200": { description: "Sources visible to current user" } } },
+      post: { summary: "Add a document (SSE progress)", responses: { "200": { description: "SSE stream" } } },
+    },
+    "/api/retrieve": {
+      post: {
+        summary: "Retrieve chunks (dashboard, X-User-Id)",
+        requestBody: { content: { "application/json": { schema: { type: "object", properties: { query: { type: "string" }, topK: { type: "number" }, minScore: { type: "number" }, sourceFilter: { type: "array", items: { type: "string" } } } } } } },
+        responses: { "200": { description: "Chunks with scores" } },
+      },
+    },
+    "/api/agent/sources": {
+      get: { summary: "List sources the API key may query", security: [{ ApiKeyAuth: [] }], responses: { "200": { description: "Visible sources" } } },
+    },
+    "/api/agent/retrieve": {
+      post: {
+        summary: "Retrieve chunks (X-API-Key)",
+        security: [{ ApiKeyAuth: [] }],
+        requestBody: { content: { "application/json": { schema: { type: "object", properties: { query: { type: "string" }, topK: { type: "number" }, minScore: { type: "number" }, sourceFilter: { type: "array", items: { type: "string" } } } } } } },
+        responses: { "200": { description: "Chunks with scores" } },
+      },
+    },
+    "/api/agent/keys": {
+      get: { summary: "List own API keys", responses: { "200": { description: "Keys" } } },
+      post: { summary: "Create API key", responses: { "201": { description: "Created (full key returned once)" } } },
+    },
+  },
+  components: {
+    securitySchemes: {
+      ApiKeyAuth: { type: "apiKey", in: "header", name: "X-API-Key" },
+    },
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pipeline Store
-// ─────────────────────────────────────────────────────────────────────────────
-interface Pipeline {
-  id: string;
-  name: string;
-  description: string;
-  generationModel: string;
-  topK: number;
-  minScore: number;
-  systemPrompt: string;
-  sourceFilter: string[];
-  enabled: boolean;
-  createdAt: string;
-}
+// ── Routes ───────────────────────────────────────────────────────────────
+app.use("/api", createSourcesRouter());
+app.use("/api", createAgentRouter());
+app.use("/api", createSystemRouter());
 
-const DEFAULT_SYSTEM_PROMPT = "You are an AI system that executes context-grounded RAG query answering and system evaluation, returning strictly compliant JSON.";
-
-/**
- * Generate a RAG answer using a local Ollama model.
- * Model name is passed as the part after "ollama:" prefix (e.g. "ollama:bjoernb/gemma4-e4b-think:latest").
- * Ollama's /api/chat endpoint is OpenAI-compatible.
- * Returns { answer, faithfulnessScore, relevanceScore } — parses JSON from the response text.
- */
-async function generateWithOllama(
-  modelName: string,
-  systemPrompt: string,
-  userPrompt: string
-): Promise<{ answer: string; faithfulnessScore: number; relevanceScore: number }> {
-  const ollamaBase = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-
-  const body = {
-    model: modelName,
-    stream: false,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user",   content: userPrompt },
-    ],
-    // Ask Ollama to return JSON — works with models that support it
-    format: "json",
-    options: { temperature: 0.1 },
-  };
-
-  const res = await fetch(`${ollamaBase}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000), // 2 min timeout for large models
-  });
-
-  if (!res.ok) {
-    throw new Error(`Ollama /api/chat failed: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json() as { message?: { content?: string } };
-  const raw = data.message?.content?.trim() ?? "";
-
-  // Strip markdown code fences if model wraps JSON in ```json ... ```
-  const jsonText = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-
-  try {
-    const parsed = JSON.parse(jsonText);
-    return {
-      answer: typeof parsed.answer === "string" ? parsed.answer : raw,
-      faithfulnessScore: typeof parsed.faithfulnessScore === "number" ? parsed.faithfulnessScore : 85,
-      relevanceScore: typeof parsed.relevanceScore === "number" ? parsed.relevanceScore : 80,
-    };
-  } catch {
-    // Model didn't return valid JSON — use the raw text as the answer
-    return { answer: raw || "No response generated.", faithfulnessScore: 80, relevanceScore: 75 };
-  }
-}
-
-let pipelines: Pipeline[] = [
-  {
-    id: "pipe-1",
-    name: "Doc-Search-Alpha",
-    description: "General-purpose document retrieval. Optimised for speed and broad coverage.",
-    generationModel: "ollama:bjoernb/gemma4-e4b-think:latest",
-    topK: 3,
-    minScore: 0.0,
-    systemPrompt: "",
-    sourceFilter: [],
-    enabled: true,
-    createdAt: new Date(Date.now() - 86400000 * 7).toISOString(),
-  },
-  {
-    id: "pipe-2",
-    name: "Legal-Brief-Retriever",
-    description: "High-precision pipeline for legal and compliance documents. Filters low-confidence chunks.",
-    generationModel: "gemini-3.5-flash",
-    topK: 5,
-    minScore: 0.6,
-    systemPrompt: "You are a legal analyst. Answer with precise citations and conservative language.",
-    sourceFilter: [],
-    enabled: true,
-    createdAt: new Date(Date.now() - 86400000 * 3).toISOString(),
-  },
-  {
-    id: "pipe-3",
-    name: "Customer-Support-LLM",
-    description: "Customer-facing support assistant. Returns friendly, concise answers.",
-    generationModel: "gemini-3.5-flash",
-    topK: 3,
-    minScore: 0.3,
-    systemPrompt: "You are a helpful customer support agent. Be friendly, concise, and always suggest next steps.",
-    sourceFilter: [],
-    enabled: false,
-    createdAt: new Date(Date.now() - 86400000 * 1).toISOString(),
-  },
-];
-
-/** Compute live stats for all pipelines from the query log. */
-function computePipelineStats(): Record<string, {
-  queryCount: number; avgLatencyMs: number; avgFaithfulness: number; avgRelevance: number; lastUsed: string | null;
-}> {
-  const stats: Record<string, { count: number; latSum: number; faithSum: number; relSum: number; lastUsed: string | null }> = {};
-  for (const log of queryLogs) {
-    if (!stats[log.pipeline]) stats[log.pipeline] = { count: 0, latSum: 0, faithSum: 0, relSum: 0, lastUsed: null };
-    const s = stats[log.pipeline];
-    s.count++;
-    s.latSum += log.latencyMs;
-    s.faithSum += log.faithfulnessScore;
-    s.relSum += log.relevanceScore;
-    if (!s.lastUsed) s.lastUsed = log.timestamp;
-  }
-  const result: Record<string, { queryCount: number; avgLatencyMs: number; avgFaithfulness: number; avgRelevance: number; lastUsed: string | null }> = {};
-  for (const [name, s] of Object.entries(stats)) {
-    result[name] = {
-      queryCount: s.count,
-      avgLatencyMs: Math.round(s.latSum / s.count),
-      avgFaithfulness: Math.round(s.faithSum / s.count),
-      avgRelevance: Math.round(s.relSum / s.count),
-      lastUsed: s.lastUsed,
-    };
-  }
-  return result;
-}
-
-// System Query Logs State
-let queryLogs: QueryLog[] = [
-  {
-    id: "log-1",
-    timestamp: "14:22:18",
-    query: "What are the compliance rules for Tier 3 data centers?",
-    pipeline: "Doc-Search-Alpha",
-    answer: "Revenues increased by 15.4% quarter-over-quarter, and standard compliance was fully met across tier 3 data center regions for regulatory operations.",
-    faithfulnessScore: 99,
-    relevanceScore: 96,
-    latencyMs: 182,
-    status: "success",
-    retrievedChunks: [
-      { text: "Standard compliance was fully met across tier 3 data center regions.", sourceName: "Q3 Financial Reports", score: 0.95 }
-    ]
-  },
-  {
-    id: "log-2",
-    timestamp: "14:20:02",
-    query: "Retrieve corporate regulations on secondary development work.",
-    pipeline: "Legal-Brief-Retriever",
-    answer: "According to the corporate policy, employees must request written super-admin permission before taking on external development work to avoid intellectual property or IP collisions.",
-    faithfulnessScore: 94,
-    relevanceScore: 91,
-    latencyMs: 315,
-    status: "success",
-    retrievedChunks: [
-      { text: "Secondary work policy states that employees must request written super-admin permission before taking on external development work to ensure there is no IP collision.", sourceName: "Customer Support Docs", score: 0.88 }
-    ]
-  },
-  {
-    id: "log-3",
-    timestamp: "14:18:45",
-    query: "Show me the distribution of our database cluster diagram.",
-    pipeline: "Doc-Search-Alpha",
-    answer: "Our primary database cluster is distributed across multiple regions to ensure high availability. The connection topology and physical server layout is detailed in the diagram below:\n\n<img src=\"https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=800&q=80\" alt=\"Enterprise Network Topology Diagram\" />",
-    faithfulnessScore: 95,
-    relevanceScore: 92,
-    latencyMs: 245,
-    status: "success",
-    retrievedChunks: [
-      { text: "Our primary database cluster is distributed across multiple regions to ensure high availability. <img src=\"https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=800&q=80\" alt=\"Enterprise Network Topology Diagram\" />", sourceName: "Enterprise Network Topology", score: 0.92 }
-    ]
-  }
-];
-
-// Active User List
-let users = [
-  { id: "u-1", name: "Jane Doe", email: "jane.doe@enterprise.ai", role: "Super Admin", lastLogin: "2 mins ago" },
-  { id: "u-2", name: "Marcus Kane", email: "m.kane@enterprise.ai", role: "Developer", lastLogin: "3 hours ago" },
-  { id: "u-3", name: "Sarah Lim", email: "slim@enterprise.ai", role: "Viewer", lastLogin: "Yesterday" }
-];
-
-// --- API Endpoints ---
-
-// Parse a PDF file and return its extracted text
-// Body: { base64: string }  (raw base64 of the PDF file, no data-URI prefix needed)
-app.post("/api/parse-pdf", async (req, res) => {
-  const { base64 } = req.body;
-  if (!base64 || typeof base64 !== "string") {
-    res.status(400).json({ error: "base64 field is required." });
-    return;
-  }
-  try {
-    const buffer = Buffer.from(base64, "base64");
-    const data = await pdfParse(buffer);
-    // Strip null bytes and other control characters PostgreSQL rejects
-    const cleanText = data.text.replace(/\x00/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ").trim();
-    res.json({ text: cleanText, pages: data.numpages });
-  } catch (err) {
-    console.error("[parse-pdf] Failed to parse PDF:", err);
-    res.status(422).json({ error: "Failed to parse PDF. Make sure the file is a valid PDF." });
-  }
+app.get("/api/openapi.json", (_req, res) => res.json(OPENAPI));
+app.get("/.well-known/openapi.json", (_req, res) => res.json(OPENAPI));
+app.get("/api/docs", (_req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Marmot RAG API</title></head>
+<body style="font-family:system-ui;max-width:720px;margin:40px auto">
+<h1>Marmot RAG — Retrieval API</h1>
+<p>OpenAPI: <a href="/api/openapi.json">/api/openapi.json</a></p>
+<h2>Agent endpoints (X-API-Key)</h2>
+<ul>
+<li><code>POST /api/agent/retrieve</code> — query → chunks (chunkId, sourceName, text, score, tokenCount) + context</li>
+<li><code>GET /api/agent/sources</code> — sources the key may query</li>
+</ul>
+<h2>Key management (dashboard)</h2>
+<ul>
+<li><code>GET|POST /api/agent/keys</code> — list / create own keys</li>
+<li><code>PATCH|DELETE /api/agent/keys/:id</code> — update / revoke</li>
+</ul>
+</body></html>`);
 });
 
-// Get health check — also probes pgvector and Ollama connectivity
-app.get("/api/health", async (req, res) => {
-  let pgConnected = false;
-  let ollamaConnected = false;
-
-  try {
-    await searchChunks(new Array(768).fill(0), 1);
-    pgConnected = true;
-  } catch { pgConnected = false; }
-
-  try {
-    const r = await fetch(`${process.env.OLLAMA_BASE_URL || "http://localhost:11434"}/api/tags`, { signal: AbortSignal.timeout(2000) });
-    ollamaConnected = r.ok;
-  } catch { ollamaConnected = false; }
-
-  res.json({
-    status: "ok",
-    geminiActive: !!getAI(),
-    pgConnected,
-    ollamaConnected,
-    pgHost: process.env.PG_HOST || "127.0.0.1",
-    pgDatabase: process.env.PG_DATABASE || "ai_hub",
-    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
-  });
-});
-
-// Get data sources
-app.get("/api/sources", (req, res) => {
-  res.json(dataSources);
-});
-
-/** Helper: embed all chunks for a doc, streaming SSE progress events. */
-async function embedAndStoreChunks(
-  docId: string,
-  docName: string,
-  rawChunks: string[],
-  send: (event: string, data: unknown) => void
-): Promise<Chunk[]> {
-  const chunksData: Chunk[] = [];
-  for (let i = 0; i < rawChunks.length; i++) {
-    const text = rawChunks[i];
-    let embedding: number[];
-    try {
-      embedding = await embedText(text);
-    } catch (err) {
-      console.error(`[embed] chunk ${i} failed (${text.split(/\s+/).length} words): ${err}`);
-      throw new Error(`Ollama embed failed on chunk ${i}: ${err}`);
-    }
-    const chunk: Chunk = {
-      id: `${docId}-chk-${i}`,
-      sourceId: docId,
-      sourceName: docName,
-      text,
-      tokensCount: text.split(/\s+/).length,
-      embedding,
-    };
-    chunksData.push(chunk);
-    await upsertChunk(chunk as Required<Chunk>);
-    // Push progress event
-    send("progress", { done: i + 1, total: rawChunks.length });
-  }
-  return chunksData;
-}
-
-// Add a new document — SSE stream that emits progress while embedding
-// Event types: "start" | "progress" | "done" | "error"
-app.post("/api/sources", async (req, res) => {
-  const { name, content, type } = req.body;
-  if (!name || !content) {
-    res.status(400).json({ error: "Name and content are required." });
-    return;
-  }
-
-  // Reject duplicate: same name already exists in dataSources
-  const existing = dataSources.find(d => d.name.trim().toLowerCase() === name.trim().toLowerCase());
-  if (existing) {
-    res.status(409).json({ error: `A document named "${name}" already exists. Delete it first or use Re-index to update it.` });
-    return;
-  }
-
-  // Set up SSE headers
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
-
-  const send = (event: string, data: unknown) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  };
-
-  const id = `src-${Date.now()}`;
-  const rawChunks = chunkText(
-    content,
-    strategyConfig.chunkSize || 120,
-    strategyConfig.chunkOverlap || 15,
-    strategyConfig.separationStrategy || "Semantic"
-  );
-
-  const newDoc: SourceDoc = {
-    id,
-    name,
-    type: type || "Text Document",
-    status: "Syncing...",
-    lastSync: "Just now",
-    vectorsCount: rawChunks.length,
-    owner: "You",
-    ownerAvatar: "https://lh3.googleusercontent.com/aida-public/AB6AXuCUZfI40ZWgWIDJa9qAzScBenlksgTyw_ZjF1AYj9rj4vCTl6wZxKDgFBZpZlSBlYev_bfIafWaYRsnrWPZBoAc0ZbuwqbkwPXveoPjiO_YWKUF0Y4kefUnFCO6PdAN3kzoe6izqFyK2vK5zfYVlcZPQJdAgJshkBloQ6ERj6IhwjyffFbxRfbjqH03mzWd_9zHkPUEefX1dr6O20QnzW3vjN2U23n40Nt2nVNcnYrymJjWwbdsGeaa",
-    content,
-    chunks: []
-  };
-
-  // Persist to DB immediately (status: Syncing...)
-  await upsertSource({ id, name, type: newDoc.type, status: newDoc.status, lastSync: newDoc.lastSync, vectorsCount: newDoc.vectorsCount, owner: newDoc.owner, ownerAvatar: newDoc.ownerAvatar ?? "", content });
-  dataSources.unshift(newDoc);
-  send("start", { doc: { ...newDoc, chunks: [] }, total: rawChunks.length });
-
-  try {
-    const chunksData = await embedAndStoreChunks(id, name, rawChunks, send);
-    newDoc.chunks = chunksData;
-    newDoc.vectorsCount = chunksData.length;
-    newDoc.status = "Synced";
-    newDoc.lastSync = new Date().toLocaleTimeString("en-US", { hour12: false });
-    // Persist final state
-    await upsertSource({ id, name, type: newDoc.type, status: "Synced", lastSync: newDoc.lastSync, vectorsCount: newDoc.vectorsCount, owner: newDoc.owner, ownerAvatar: newDoc.ownerAvatar ?? "", content });
-    send("done", { doc: { ...newDoc, chunks: [] } });
-  } catch (err) {
-    newDoc.status = "Auth Error";
-    await upsertSource({ id, name, type: newDoc.type, status: "Auth Error", lastSync: newDoc.lastSync, vectorsCount: 0, owner: newDoc.owner, ownerAvatar: newDoc.ownerAvatar ?? "", content });
-    send("error", { message: String(err) });
-  }
-
-  res.end();
-});
-
-// Delete a source document and its pgvector chunks
-app.delete("/api/sources/:id", async (req, res) => {
-  const { id } = req.params;
-  const idx = dataSources.findIndex(d => d.id === id);
-  if (idx === -1) { res.status(404).json({ error: "Source not found" }); return; }
-  dataSources.splice(idx, 1);
-  try {
-    await deleteChunksBySource(id);
-    await deleteSource(id);
-  } catch (err) {
-    console.warn("[delete-source] pgvector/source cleanup failed:", err);
-  }
-  res.json({ message: "Source deleted" });
-});
-
-// Re-index (re-chunk + re-embed) an existing source — SSE stream
-app.post("/api/sources/:id/reindex", async (req, res) => {
-  const { id } = req.params;
-  const doc = dataSources.find(d => d.id === id);
-  if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
-
-  const send = (event: string, data: unknown) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  };
-
-  doc.status = "Syncing...";
-  const rawChunks = chunkText(
-    doc.content,
-    strategyConfig.chunkSize || 120,
-    strategyConfig.chunkOverlap || 15,
-    strategyConfig.separationStrategy || "Semantic"
-  );
-
-  // Remove old chunks from pgvector
-  try {
-    await deleteChunksBySource(id);
-  } catch (err) {
-    console.warn("[reindex] pgvector cleanup failed:", err);
-  }
-
-  send("start", { doc: { ...doc, chunks: [] }, total: rawChunks.length });
-
-  try {
-    const chunksData = await embedAndStoreChunks(id, doc.name, rawChunks, send);
-    doc.chunks = chunksData;
-    doc.vectorsCount = chunksData.length;
-    doc.status = "Synced";
-    doc.lastSync = new Date().toLocaleTimeString("en-US", { hour12: false });
-    await upsertSource({ id, name: doc.name, type: doc.type, status: "Synced", lastSync: doc.lastSync, vectorsCount: doc.vectorsCount, owner: doc.owner, ownerAvatar: doc.ownerAvatar ?? "", content: doc.content });
-    send("done", { doc: { ...doc, chunks: [] } });
-  } catch (err) {
-    doc.status = "Auth Error";
-    await upsertSource({ id, name: doc.name, type: doc.type, status: "Auth Error", lastSync: doc.lastSync, vectorsCount: doc.vectorsCount, owner: doc.owner, ownerAvatar: doc.ownerAvatar ?? "", content: doc.content });
-    send("error", { message: String(err) });
-  }
-
-  res.end();
-});
-
-// ─── Pipeline CRUD ────────────────────────────────────────────────────────────
-
-app.get("/api/pipelines", (req, res) => {
-  const stats = computePipelineStats();
-  const result = pipelines.map(p => ({
-    ...p,
-    stats: stats[p.name] ?? { queryCount: 0, avgLatencyMs: 0, avgFaithfulness: 0, avgRelevance: 0, lastUsed: null },
-  }));
-  res.json(result);
-});
-
-app.post("/api/pipelines", (req, res) => {
-  const { name, description, generationModel, topK, minScore, systemPrompt, sourceFilter, enabled } = req.body;
-  if (!name) { res.status(400).json({ error: "name is required" }); return; }
-  const exists = pipelines.find(p => p.name === name);
-  if (exists) { res.status(409).json({ error: "Pipeline name already exists" }); return; }
-  const p: Pipeline = {
-    id: `pipe-${Date.now()}`,
-    name,
-    description: description || "",
-    generationModel: generationModel || "gemini-3.5-flash",
-    topK: topK ?? 3,
-    minScore: minScore ?? 0.0,
-    systemPrompt: systemPrompt || "",
-    sourceFilter: sourceFilter || [],
-    enabled: enabled ?? true,
-    createdAt: new Date().toISOString(),
-  };
-  pipelines.push(p);
-  res.status(201).json(p);
-});
-
-app.put("/api/pipelines/:id", (req, res) => {
-  const idx = pipelines.findIndex(p => p.id === req.params.id);
-  if (idx === -1) { res.status(404).json({ error: "Pipeline not found" }); return; }
-  // Prevent renaming to an existing name
-  if (req.body.name && req.body.name !== pipelines[idx].name) {
-    const clash = pipelines.find(p => p.name === req.body.name);
-    if (clash) { res.status(409).json({ error: "Pipeline name already exists" }); return; }
-  }
-  pipelines[idx] = { ...pipelines[idx], ...req.body, id: pipelines[idx].id, createdAt: pipelines[idx].createdAt };
-  res.json(pipelines[idx]);
-});
-
-app.delete("/api/pipelines/:id", (req, res) => {
-  const idx = pipelines.findIndex(p => p.id === req.params.id);
-  if (idx === -1) { res.status(404).json({ error: "Pipeline not found" }); return; }
-  pipelines.splice(idx, 1);
-  res.json({ message: "Pipeline deleted" });
-});
-
-// ─── RAG Query (uses pipeline config) ────────────────────────────────────────
-
-// Perform RAG Search & Context-Grounded Query Answering
-app.post("/api/query", async (req, res) => {
-  const { query, pipeline: pipelineName } = req.body;
-  if (!query) {
-    res.status(400).json({ error: "Query is required" });
-    return;
-  }
-
-  // Resolve pipeline config — fall back to sensible defaults
-  const pipelineCfg: Pipeline = pipelines.find(p => p.name === pipelineName && p.enabled)
-    ?? pipelines.find(p => p.enabled)
-    ?? { id: "default", name: pipelineName || "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
-
-  const startTime = Date.now();
-
-  // Embed the query via Ollama
-  let queryEmbedding: number[];
-  try {
-    queryEmbedding = await embedText(query);
-  } catch (err) {
-    console.error("[query] Ollama embed failed:", err);
-    res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
-    return;
-  }
-
-  // Determine sources to exclude
-  const excludedIds = dataSources
-    .filter(d => d.status === "Paused" || d.status === "Auth Error")
-    .map(d => d.id);
-
-  // Apply pipeline sourceFilter (only search specified sources if set)
-  const activeSourceIds = pipelineCfg.sourceFilter.length > 0
-    ? dataSources.filter(d => pipelineCfg.sourceFilter.includes(d.id) && d.status === "Synced").map(d => d.id)
-    : null;
-
-  // Vector search using pipeline topK; post-filter by minScore
-  const pgResults = await searchChunks(queryEmbedding, pipelineCfg.topK * 2, excludedIds);
-  const filtered = pgResults.filter(r =>
-    r.score >= pipelineCfg.minScore &&
-    (activeSourceIds === null || activeSourceIds.includes(r.sourceId))
-  ).slice(0, pipelineCfg.topK);
-
-  const topResults = filtered.map(r => ({
-    chunk: { id: r.id, sourceId: r.sourceId, sourceName: r.sourceName, text: r.text, tokensCount: r.tokensCount } as Chunk,
-    similarity: r.score,
-  }));
-
-  const retrievedContext = topResults
-    .map((res, i) => `[Document ${i + 1}: ${res.chunk.sourceName}] \n${res.chunk.text}`)
-    .join("\n\n");
-
-  const ai = getAI();
-  let ragAnswer = "";
-  let faithfulnessScore = 90;
-  let relevanceScore = 85;
-
-  const sysInstruction = pipelineCfg.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
-  const userPrompt = `You are a highly analytical RAG Retrieval QA System.
-Below is the User's Query and the Retrieved Context Chunks from the document database.
-
-USER QUERY:
-"${query}"
-
-RETRIEVED CONTEXT CHUNKS:
-${retrievedContext || "NO RELEVANT CONTEXT FOUND"}
-
-INSTRUCTIONS:
-1. Answer the query truthfully based ONLY on the retrieved context chunks.
-2. Cite your sources using bracketed notations like [Source Name].
-3. Ensure absolute accuracy. Do not make up facts.
-4. If any retrieved context chunk contains an HTML <img> tag, preserve it in your answer.
-5. Evaluate yourself and provide faithfulnessScore (0-100) and relevanceScore (0-100).
-
-Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceScore": 90 }`;
-
-  const isOllama = pipelineCfg.generationModel.startsWith("ollama:");
-
-  if (isOllama) {
-    // ── Local Ollama LLM generation ──────────────────────────────────────────
-    const ollamaModel = pipelineCfg.generationModel.slice("ollama:".length);
-    try {
-      console.log(`[query] Using Ollama model: ${ollamaModel}`);
-      const result = await generateWithOllama(ollamaModel, sysInstruction, userPrompt);
-      ragAnswer = result.answer;
-      faithfulnessScore = result.faithfulnessScore;
-      relevanceScore = result.relevanceScore;
-    } catch (err) {
-      console.error("[query] Ollama generation failed:", err);
-      ragAnswer = `[Ollama Error] ${String(err)}\n\nRetrieved context:\n\n${retrievedContext || "No context found."}`;
-    }
-  } else if (ai) {
-    // ── Gemini cloud generation ──────────────────────────────────────────────
-    try {
-      const response = await ai.models.generateContent({
-        model: pipelineCfg.generationModel,
-        contents: userPrompt,
-        config: {
-          systemInstruction: sysInstruction,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: { answer: { type: Type.STRING }, faithfulnessScore: { type: Type.INTEGER }, relevanceScore: { type: Type.INTEGER } },
-            required: ["answer", "faithfulnessScore", "relevanceScore"],
-          },
-        },
-      });
-      if (response.text) {
-        const parsed = JSON.parse(response.text.trim());
-        ragAnswer = parsed.answer;
-        faithfulnessScore = parsed.faithfulnessScore;
-        relevanceScore = parsed.relevanceScore;
-      }
-    } catch (err) {
-      console.error("Gemini generation failed:", err);
-      ragAnswer = `Failed to generate response using Gemini. Retrieved context:\n\n${retrievedContext || "No context found."}`;
-    }
-  }
-
-  if (!ragAnswer) {
-    if (topResults.length > 0) {
-      ragAnswer = `[Offline Mode] Based on "${topResults[0].chunk.sourceName}":\n\n${topResults[0].chunk.text}\n\n(Configure GEMINI_API_KEY or set pipeline to ollama:model-name for AI generation.)`;
-      faithfulnessScore = 95; relevanceScore = 80;
-    } else {
-      ragAnswer = "No context found matching your query. Please upload documents in the Knowledge Base first.";
-      faithfulnessScore = 100; relevanceScore = 10;
-    }
-  }
-
-  const latencyMs = Date.now() - startTime;
-  const newLog: QueryLog = {
-    id: `log-${Date.now()}`,
-    timestamp: new Date().toLocaleTimeString("en-US", { hour12: false }),
-    query,
-    pipeline: pipelineCfg.name,
-    answer: ragAnswer,
-    faithfulnessScore,
-    relevanceScore,
-    latencyMs,
-    status: faithfulnessScore > 85 ? "success" : "warning",
-    retrievedChunks: topResults.map(r => ({ text: r.chunk.text, sourceName: r.chunk.sourceName, score: Math.round(r.similarity * 100) / 100 })),
-  };
-
-  queryLogs.unshift(newLog);
-  res.json(newLog);
-});
-
-// Get current system config
-app.get("/api/config", (req, res) => {
-  res.json(strategyConfig);
-});
-
-// Update config
-app.post("/api/config", (req, res) => {
-  strategyConfig = { ...strategyConfig, ...req.body };
-  res.json({ message: "Configuration saved successfully", config: strategyConfig });
-});
-
-// Get audit/query logs
-app.get("/api/logs", (req, res) => {
-  res.json(queryLogs);
-});
-
-// Get active providers
-app.get("/api/providers", (req, res) => {
-  res.json(strategyConfig.providerList);
-});
-
-// Configure providers
-app.post("/api/providers", (req, res) => {
-  const { providers } = req.body;
-  if (providers) {
-    strategyConfig.providerList = providers;
-  }
-  res.json({ message: "Providers saved", providers: strategyConfig.providerList });
-});
-
-// Get users list
-app.get("/api/users", (req, res) => {
-  res.json(users);
-});
-
-// Add user
-app.post("/api/users", (req, res) => {
-  const { name, email, role } = req.body;
-  if (!name || !email) {
-    res.status(400).json({ error: "Name and email are required" });
-    return;
-  }
-  const newUser = {
-    id: `u-${Date.now()}`,
-    name,
-    email,
-    role: role || "Viewer",
-    lastLogin: "Just now"
-  };
-  users.push(newUser);
-  res.json(newUser);
-});
-
-// Delete user
-app.delete("/api/users/:id", (req, res) => {
-  const { id } = req.params;
-  users = users.filter(u => u.id !== id);
-  res.json({ message: "User deleted" });
-});
-
-// Simulate connection test
-app.post("/api/test-connectivity", (req, res) => {
-  setTimeout(() => {
-    res.json({ success: true, message: "Connection to Vector DB succeeded!" });
-  }, 1000);
-});
-
-// ─── Agent API — Key Management & RAG Endpoints ───────────────────────────────
-//
-// External AI agents (LangChain, LlamaIndex, custom bots, etc.) call these
-// routes with the header:  X-API-Key: mrmk_<secret>
-//
-// Three public-facing agent endpoints:
-//   POST /api/agent/retrieve  — pure vector search, no LLM generation
-//   POST /api/agent/query     — full RAG (retrieve + generate), simplified response
-//   GET  /api/agent/sources   — list available knowledge-base sources
-//
-// Management endpoints (internal / dashboard):
-//   GET    /api/agent/keys         — list all keys (keys are masked)
-//   POST   /api/agent/keys         — create a new key (returns full key once)
-//   PATCH  /api/agent/keys/:id     — update label / rateLimit / pipelineId / sourceFilter / enabled
-//   DELETE /api/agent/keys/:id     — revoke key
-
-interface AgentApiKey {
-  id: string;
-  label: string;
-  key: string;          // full secret — never sent to the browser after creation
-  keyPreview: string;   // "mrmk_****...****<last4>"
-  pipelineId: string | null;
-  sourceFilter: string[];
-  rateLimit: number;    // req/min, 0 = unlimited
-  enabled: boolean;
-  createdAt: string;
-  lastUsedAt: string | null;
-  usageCount: number;
-  usageThisMonth: number;
-  _monthStamp: string;  // "YYYY-MM" for monthly reset
-}
-
-// In-memory store — seeded with one demo key
-let agentKeys: AgentApiKey[] = [
-  {
-    id: "akey-1",
-    label: "Demo LangChain Agent",
-    key: "mrmk_demo_0000000000000000000000000000000000000000000000000000000000000000",
-    keyPreview: "mrmk_demo_****...****0000",
-    pipelineId: null,
-    sourceFilter: [],
-    rateLimit: 60,
-    enabled: true,
-    createdAt: new Date(Date.now() - 86400000 * 5).toISOString(),
-    lastUsedAt: new Date(Date.now() - 3600000).toISOString(),
-    usageCount: 142,
-    usageThisMonth: 89,
-    _monthStamp: new Date().toISOString().slice(0, 7),
-  },
-];
-
-/** Generate a cryptographically random API key string. */
-function generateApiKey(): string {
-  // 32 random bytes → 64 hex chars
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
-  return `mrmk_${hex}`;
-}
-
-/** Mask an API key for display: show prefix + last 4 chars only. */
-function maskKey(key: string): string {
-  const parts = key.split("_");
-  const prefix = parts.slice(0, 2).join("_"); // "mrmk_" or "mrmk_demo"
-  return `${prefix}_****...****${key.slice(-4)}`;
-}
-
-/** Per-key in-memory rate limiter: { [keyId]: { windowStart: number, count: number } } */
-const _rateLimitWindows: Record<string, { windowStart: number; count: number }> = {};
-
-/**
- * Middleware: validate X-API-Key header and attach the resolved key record to req.
- * Enforces rate limiting and enabled/disabled state.
- */
-function agentAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
-  const raw = req.headers["x-api-key"] as string | undefined;
-  if (!raw) {
-    res.status(401).json({ error: "Missing X-API-Key header." });
-    return;
-  }
-  const keyRecord = agentKeys.find(k => k.key === raw);
-  if (!keyRecord) {
-    res.status(401).json({ error: "Invalid API key." });
-    return;
-  }
-  if (!keyRecord.enabled) {
-    res.status(403).json({ error: "This API key has been disabled." });
-    return;
-  }
-
-  // Rate limit check (sliding 60-second window)
-  if (keyRecord.rateLimit > 0) {
-    const now = Date.now();
-    const win = _rateLimitWindows[keyRecord.id] ?? { windowStart: now, count: 0 };
-    if (now - win.windowStart > 60_000) {
-      win.windowStart = now;
-      win.count = 0;
-    }
-    win.count++;
-    _rateLimitWindows[keyRecord.id] = win;
-    if (win.count > keyRecord.rateLimit) {
-      res.status(429).json({ error: `Rate limit exceeded. Max ${keyRecord.rateLimit} req/min.` });
-      return;
-    }
-  }
-
-  // Update usage counters
-  const nowIso = new Date().toISOString();
-  const monthStamp = nowIso.slice(0, 7);
-  keyRecord.lastUsedAt = nowIso;
-  keyRecord.usageCount++;
-  if (keyRecord._monthStamp !== monthStamp) {
-    keyRecord._monthStamp = monthStamp;
-    keyRecord.usageThisMonth = 0;
-  }
-  keyRecord.usageThisMonth++;
-
-  // Attach to request for downstream handlers
-  (req as any)._agentKey = keyRecord;
-  next();
-}
-
-// ── Management: list keys (masked) ────────────────────────────────────────────
-app.get("/api/agent/keys", (req, res) => {
-  res.json(agentKeys.map(k => ({ ...k, key: undefined, keyPreview: k.keyPreview })));
-});
-
-// ── Management: create key ─────────────────────────────────────────────────────
-app.post("/api/agent/keys", (req, res) => {
-  const { label, pipelineId, sourceFilter, rateLimit } = req.body;
-  if (!label || !label.trim()) {
-    res.status(400).json({ error: "label is required" });
-    return;
-  }
-  const fullKey = generateApiKey();
-  const newKey: AgentApiKey = {
-    id: `akey-${Date.now()}`,
-    label: label.trim(),
-    key: fullKey,
-    keyPreview: maskKey(fullKey),
-    pipelineId: pipelineId ?? null,
-    sourceFilter: sourceFilter ?? [],
-    rateLimit: typeof rateLimit === "number" ? rateLimit : 60,
-    enabled: true,
-    createdAt: new Date().toISOString(),
-    lastUsedAt: null,
-    usageCount: 0,
-    usageThisMonth: 0,
-    _monthStamp: new Date().toISOString().slice(0, 7),
-  };
-  agentKeys.push(newKey);
-  // Return the FULL key in this response only — browser must copy it now
-  res.status(201).json({ ...newKey, key: fullKey });
-});
-
-// ── Management: update key ─────────────────────────────────────────────────────
-app.patch("/api/agent/keys/:id", (req, res) => {
-  const key = agentKeys.find(k => k.id === req.params.id);
-  if (!key) { res.status(404).json({ error: "Key not found" }); return; }
-  const { label, pipelineId, sourceFilter, rateLimit, enabled } = req.body;
-  if (label !== undefined) key.label = label;
-  if (pipelineId !== undefined) key.pipelineId = pipelineId;
-  if (sourceFilter !== undefined) key.sourceFilter = sourceFilter;
-  if (typeof rateLimit === "number") key.rateLimit = rateLimit;
-  if (typeof enabled === "boolean") key.enabled = enabled;
-  res.json({ ...key, key: undefined, keyPreview: key.keyPreview });
-});
-
-// ── Management: revoke key ─────────────────────────────────────────────────────
-app.delete("/api/agent/keys/:id", (req, res) => {
-  const idx = agentKeys.findIndex(k => k.id === req.params.id);
-  if (idx === -1) { res.status(404).json({ error: "Key not found" }); return; }
-  agentKeys.splice(idx, 1);
-  res.json({ message: "Key revoked" });
-});
-
-// ── Agent: list available sources ──────────────────────────────────────────────
-// GET /api/agent/sources
-// Returns the set of Synced source documents the agent may query against.
-// Response: { sources: [{ id, name, type, vectorsCount, lastSync }] }
-app.get("/api/agent/sources", agentAuth, (req, res) => {
-  const agentKey = (req as any)._agentKey as AgentApiKey;
-  // Apply source filter from key config
-  const allowed = agentKey.sourceFilter.length > 0
-    ? dataSources.filter(s => s.status === "Synced" && agentKey.sourceFilter.includes(s.id))
-    : dataSources.filter(s => s.status === "Synced");
-  res.json({
-    sources: allowed.map(s => ({
-      id: s.id,
-      name: s.name,
-      type: s.type,
-      vectorsCount: s.vectorsCount,
-      lastSync: s.lastSync,
-    })),
-  });
-});
-
-// ── Agent: pure vector retrieval (no generation) ───────────────────────────────
-// POST /api/agent/retrieve
-// Body: { query: string, topK?: number, minScore?: number, sourceFilter?: string[] }
-// Response: { query, chunks: [{ id, sourceId, sourceName, text, score }], latencyMs }
-//
-// Use this when your agent has its own LLM and only needs relevant context chunks.
-app.post("/api/agent/retrieve", agentAuth, async (req, res) => {
-  const agentKey = (req as any)._agentKey as AgentApiKey;
-  const { query, topK = 5, minScore = 0.0, sourceFilter: reqSourceFilter } = req.body;
-
-  if (!query || typeof query !== "string") {
-    res.status(400).json({ error: "query (string) is required" });
-    return;
-  }
-
-  const startTime = Date.now();
-
-  // Embed query
-  let queryEmbedding: number[];
-  try {
-    queryEmbedding = await embedText(query);
-  } catch (err) {
-    res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
-    return;
-  }
-
-  // Merge key-level + request-level source filters
-  const keyFilter = agentKey.sourceFilter;
-  const reqFilter: string[] = Array.isArray(reqSourceFilter) ? reqSourceFilter : [];
-  const effectiveFilter = keyFilter.length > 0
-    ? (reqFilter.length > 0 ? keyFilter.filter(id => reqFilter.includes(id)) : keyFilter)
-    : reqFilter;
-
-  const excludedIds = dataSources
-    .filter(d => d.status === "Paused" || d.status === "Auth Error")
-    .map(d => d.id);
-
-  const pgResults = await searchChunks(queryEmbedding, (topK as number) * 2, excludedIds);
-  const filtered = pgResults
-    .filter(r => {
-      if (r.score < (minScore as number)) return false;
-      if (effectiveFilter.length > 0 && !effectiveFilter.includes(r.sourceId)) return false;
-      return true;
-    })
-    .slice(0, topK as number);
-
-  res.json({
-    query,
-    chunks: filtered.map(r => ({
-      id: r.id,
-      sourceId: r.sourceId,
-      sourceName: r.sourceName,
-      text: r.text,
-      score: Math.round(r.score * 10000) / 10000,
-    })),
-    latencyMs: Date.now() - startTime,
-  });
-});
-
-// ── Agent: full RAG query (retrieve + generate) ────────────────────────────────
-// POST /api/agent/query
-// Body: { query: string, pipeline?: string, topK?: number, minScore?: number, sourceFilter?: string[] }
-// Response: { answer, pipeline, faithfulnessScore, relevanceScore, latencyMs, sources }
-//
-// This is the "one-shot" endpoint — the agent sends a question, gets a grounded answer.
-// pipeline name is optional; if omitted, the key's bound pipeline is used; falls back to first enabled.
-app.post("/api/agent/query", agentAuth, async (req, res) => {
-  const agentKey = (req as any)._agentKey as AgentApiKey;
-  const { query, pipeline: pipelineName, topK: reqTopK, minScore: reqMinScore, sourceFilter: reqSourceFilter } = req.body;
-
-  if (!query || typeof query !== "string") {
-    res.status(400).json({ error: "query (string) is required" });
-    return;
-  }
-
-  // Resolve pipeline
-  let pipelineCfg: Pipeline;
-  if (pipelineName) {
-    pipelineCfg = pipelines.find(p => p.name === pipelineName && p.enabled)
-      ?? pipelines.find(p => p.enabled)
-      ?? { id: "default", name: "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
-  } else if (agentKey.pipelineId) {
-    pipelineCfg = pipelines.find(p => p.id === agentKey.pipelineId && p.enabled)
-      ?? pipelines.find(p => p.enabled)
-      ?? { id: "default", name: "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
-  } else {
-    pipelineCfg = pipelines.find(p => p.enabled)
-      ?? { id: "default", name: "Default", description: "", generationModel: "gemini-3.5-flash", topK: 3, minScore: 0.0, systemPrompt: "", sourceFilter: [], enabled: true, createdAt: "" };
-  }
-
-  // Request-level overrides (optional)
-  const effectiveTopK = typeof reqTopK === "number" ? reqTopK : pipelineCfg.topK;
-  const effectiveMinScore = typeof reqMinScore === "number" ? reqMinScore : pipelineCfg.minScore;
-
-  // Merge source filters: key-level ∩ request-level (if any)
-  const keyFilter = agentKey.sourceFilter;
-  const reqFilter: string[] = Array.isArray(reqSourceFilter) ? reqSourceFilter : [];
-  const pipeFilter = pipelineCfg.sourceFilter;
-  // Priority: request > key > pipeline (intersect where both set)
-  let effectiveFilter: string[] = pipeFilter;
-  if (keyFilter.length > 0) effectiveFilter = effectiveFilter.length > 0 ? effectiveFilter.filter(id => keyFilter.includes(id)) : keyFilter;
-  if (reqFilter.length > 0) effectiveFilter = effectiveFilter.length > 0 ? effectiveFilter.filter(id => reqFilter.includes(id)) : reqFilter;
-
-  const startTime = Date.now();
-
-  // Embed
-  let queryEmbedding: number[];
-  try {
-    queryEmbedding = await embedText(query);
-  } catch (err) {
-    res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
-    return;
-  }
-
-  const excludedIds = dataSources
-    .filter(d => d.status === "Paused" || d.status === "Auth Error")
-    .map(d => d.id);
-
-  const pgResults = await searchChunks(queryEmbedding, effectiveTopK * 2, excludedIds);
-  const topResults = pgResults
-    .filter(r => {
-      if (r.score < effectiveMinScore) return false;
-      if (effectiveFilter.length > 0 && !effectiveFilter.includes(r.sourceId)) return false;
-      return true;
-    })
-    .slice(0, effectiveTopK);
-
-  const retrievedContext = topResults
-    .map((r, i) => `[Document ${i + 1}: ${r.sourceName}]\n${r.text}`)
-    .join("\n\n");
-
-  const ai = getAI();
-  let ragAnswer = "";
-  let faithfulnessScore = 90;
-  let relevanceScore = 85;
-
-  const sysInstruction = pipelineCfg.systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
-  const userPrompt = `You are a highly analytical RAG Retrieval QA System.
-Below is the User's Query and the Retrieved Context Chunks from the document database.
-
-USER QUERY:
-"${query}"
-
-RETRIEVED CONTEXT CHUNKS:
-${retrievedContext || "NO RELEVANT CONTEXT FOUND"}
-
-INSTRUCTIONS:
-1. Answer the query truthfully based ONLY on the retrieved context chunks.
-2. Cite your sources using bracketed notations like [Source Name].
-3. Ensure absolute accuracy. Do not make up facts.
-4. If any retrieved context chunk contains an HTML <img> tag, preserve it in your answer.
-5. Evaluate yourself and provide faithfulnessScore (0-100) and relevanceScore (0-100).
-
-Respond as strict JSON: { "answer": "...", "faithfulnessScore": 95, "relevanceScore": 90 }`;
-
-  const isOllama = pipelineCfg.generationModel.startsWith("ollama:");
-
-  if (isOllama) {
-    const ollamaModel = pipelineCfg.generationModel.slice("ollama:".length);
-    try {
-      const result = await generateWithOllama(ollamaModel, sysInstruction, userPrompt);
-      ragAnswer = result.answer;
-      faithfulnessScore = result.faithfulnessScore;
-      relevanceScore = result.relevanceScore;
-    } catch (err) {
-      ragAnswer = `[Ollama Error] ${String(err)}\n\nRetrieved context:\n\n${retrievedContext || "No context found."}`;
-    }
-  } else if (ai) {
-    try {
-      const response = await ai.models.generateContent({
-        model: pipelineCfg.generationModel,
-        contents: userPrompt,
-        config: {
-          systemInstruction: sysInstruction,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: { answer: { type: Type.STRING }, faithfulnessScore: { type: Type.INTEGER }, relevanceScore: { type: Type.INTEGER } },
-            required: ["answer", "faithfulnessScore", "relevanceScore"],
-          },
-        },
-      });
-      if (response.text) {
-        const parsed = JSON.parse(response.text.trim());
-        ragAnswer = parsed.answer;
-        faithfulnessScore = parsed.faithfulnessScore;
-        relevanceScore = parsed.relevanceScore;
-      }
-    } catch (err) {
-      ragAnswer = `Failed to generate response. Retrieved context:\n\n${retrievedContext || "No context found."}`;
-    }
-  }
-
-  if (!ragAnswer) {
-    ragAnswer = topResults.length > 0
-      ? `[Offline Mode] ${topResults[0].text}`
-      : "No context found matching your query.";
-  }
-
-  const latencyMs = Date.now() - startTime;
-
-  // Log the agent query alongside regular query logs
-  const newLog: QueryLog = {
-    id: `log-${Date.now()}`,
-    timestamp: new Date().toLocaleTimeString("en-US", { hour12: false }),
-    query,
-    pipeline: `${pipelineCfg.name} [agent:${agentKey.label}]`,
-    answer: ragAnswer,
-    faithfulnessScore,
-    relevanceScore,
-    latencyMs,
-    status: faithfulnessScore > 85 ? "success" : "warning",
-    retrievedChunks: topResults.map(r => ({ text: r.text, sourceName: r.sourceName, score: Math.round(r.score * 100) / 100 })),
-  };
-  queryLogs.unshift(newLog);
-
-  // Simplified response for agents
-  res.json({
-    answer: ragAnswer,
-    pipeline: pipelineCfg.name,
-    faithfulnessScore,
-    relevanceScore,
-    latencyMs,
-    sources: topResults.map(r => ({
-      id: r.id,
-      sourceName: r.sourceName,
-      score: Math.round(r.score * 10000) / 10000,
-      excerpt: r.text.slice(0, 200),
-    })),
-  });
-});
-
-// --- Vite setup or production static server ---
+// ── Vite setup or production static server ──────────────────────────────
 async function startServer() {
-  // Initialise pgvector tables, then load/seed sources from DB
+  // Init tables, then load/seed all state from DB
   await initDb();
-  await initializeSources();
+  await initializeState();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "spa",
+      appType: "custom",
     });
     app.use(vite.middlewares);
+    // SPA fallback: serve index.html ONLY for browser navigation (non-API, non-asset requests)
+    app.use(async (req, res, next) => {
+      if (
+        req.path.startsWith("/api") ||
+        req.path.startsWith("/.well-known") ||
+        req.path.includes(".")
+      ) {
+        return next();
+      }
+      try {
+        const { readFileSync } = await import("fs");
+        const { resolve } = await import("path");
+        let html = readFileSync(resolve(process.cwd(), "index.html"), "utf-8");
+        html = await vite.transformIndexHtml(req.originalUrl, html);
+        res.status(200).setHeader("Content-Type", "text/html").end(html);
+      } catch (e) {
+        next(e);
+      }
+    });
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
@@ -1415,9 +411,45 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+  // Global error handler — catches unhandled errors thrown by route handlers
+  app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error("[error]", err.stack ?? err.message);
+    res.status(500).json({ error: "Internal server error." });
   });
+
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[server] Listening on port ${PORT}`);
+  });
+
+  // API versioning stub — /api/v1/* mirrors /api/*
+  app.all("/api/v1/*", (req, res) => {
+    req.url = req.url.replace(/^\/api\/v1/, "/api");
+    app._router.handle(req, res, () => {
+      if (!res.headersSent) res.status(404).json({ error: "Not found" });
+    });
+  });
+
+  // Graceful shutdown
+  const shutdown = (signal: string) => {
+    console.log(`[server] ${signal} received — shutting down gracefully`);
+    httpServer.close(async () => {
+      console.log("[server] HTTP server closed.");
+      try {
+        await closePool();
+        console.log("[db] Connection pool closed.");
+      } catch { /* pool may already be closed */ }
+      process.exit(0);
+    });
+    setTimeout(() => {
+      console.error("[server] Forced shutdown after 30s timeout.");
+      process.exit(1);
+    }, 30_000).unref();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-startServer();
+startServer().catch(err => {
+  console.error("[server] Failed to start:", err);
+  process.exit(1);
+});
