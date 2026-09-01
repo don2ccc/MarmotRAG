@@ -1,8 +1,12 @@
-# Marmot RAG — Enterprise Knowledge Retrieval Service
+# MarmotRAG — Knowledge Chunking & Retrieval Service
 
-Marmot RAG is a multi-user, shareable **retrieval service**: users upload and manage their own documents, choose whether to share each document with the platform, and expose their knowledge through API keys so other applications can retrieve relevant chunks over HTTP.
+MarmotRAG is a multi-user, shareable **knowledge retrieval service** — not a full RAG system. The "G" (generation) has been deliberately removed: the service never composes an answer. It runs a three-stage pipeline and exposes the result over HTTP:
 
-**Retrieval only — no answer generation.** The service returns the most relevant chunks (with scores) for a query; callers bring their own LLM if they want to generate answers from the retrieved context.
+1. **Chunk** — uploaded documents (PDF / plain text) are split into pieces using Semantic, Fixed, or Recursive strategies.
+2. **Embed** — each chunk is vectorized locally via Ollama (`qwen3-embedding:4b`).
+3. **Retrieve** — callers query the vector store through the API and get back the most relevant chunks with similarity scores.
+
+Callers bring their own LLM (or any downstream logic) if they want to generate answers from the retrieved chunks; that step happens entirely outside MarmotRAG.
 
 ---
 
@@ -16,11 +20,15 @@ Marmot RAG is a multi-user, shareable **retrieval service**: users upload and ma
 | **Chunking** | Three strategies: Semantic, Fixed, Recursive — CJK-aware via `jieba-wasm`; global config (size/overlap) |
 | **Embedding** | Local Ollama (`qwen3-embedding:4b`, 2000-dim, Matryoshka truncation) |
 | **Vector Store** | PostgreSQL + `pgvector` with HNSW cosine index |
-| **Retrieval API** | `POST /api/agent/retrieve` returns chunks + scores + pre-assembled context |
+| **Retrieval API** | `POST /api/agent/retrieve` returns chunks + scores (chunk retrieval only — no generation) |
 | **API Keys** | Per-user keys with `X-API-Key` auth, rate limiting, usage counters, per-key source scoping |
 | **Observability** | Retrieval query log with latency and retrieved chunks; dashboard stats |
 
 ## 2. Architecture
+
+```
+Pipeline: Document → Chunk → Embed → Store (pgvector) → Retrieve via API
+```
 
 ```
 Browser SPA (React)                    External apps
@@ -131,7 +139,7 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 | `DELETE` | `/api/sources/:id` | Delete source + vectors (owner only) |
 | `GET` | `/api/sources/:id/chunks` | Chunk preview (visible sources) |
 | `POST` | `/api/parse-pdf` | Extract text from Base64 PDF |
-| `POST` | `/api/retrieve` | Retrieve chunks (Playground) |
+| `POST` | `/api/retrieve` | Retrieve chunks (Playground, no generation) |
 | `GET/POST` | `/api/config` | Global chunking config |
 | `GET` | `/api/stats` | Dashboard stats for current user |
 | `GET` | `/api/logs` · `/api/logs/export` | Query log for current user |
@@ -140,7 +148,7 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 
 ### 8.2 Agent API (external, `X-API-Key`)
 
-**The only public endpoint is `POST /api/agent/retrieve`** — everything else in the system is dashboard-internal and not exposed to external callers.
+**The only public endpoint is `POST /api/agent/retrieve`** — everything else in the system is dashboard-internal and not exposed to external callers. The endpoint returns the most relevant chunks only; it never generates an answer.
 
 ```bash
 curl -X POST http://localhost:3000/api/agent/retrieve \
