@@ -40,8 +40,17 @@ export async function initDb(): Promise<void> {
   // the "client already executing" deprecation warning from pg-pool.
   await pool.query("CREATE EXTENSION IF NOT EXISTS vector");
   // Migrate embedding dimension if the table already exists with a different size.
-  // Target: vector(2000) — pgvector ivfflat hard limit is 2000 dims.
-  const TARGET_TYPMOD = 2008; // vector(2000) = 2000 + 8
+  // Target: vector(2000) — pgvector HNSW/ivfflat hard limit is 2000 dims.
+  // pgvector encodes vector(n) typmod differently across versions: some store
+  // just the dimension count (n), others store n + margin (n + 8). On this
+  // stack (pgvector 0.8.x) a vector(2000) column reports atttypmod = 2000, so
+  // requiring exactly 2008 would drop and recreate marmot_chunks on EVERY
+  // startup, wiping all stored vectors. Accept both encodings of the target
+  // dimension; only rebuild when the decoded dimension genuinely differs
+  // (e.g. switching to a 2560-dim embedding model).
+  const TARGET_DIM = 2000;
+  const isTargetVectorDims = (attTypmod: number): boolean =>
+    attTypmod === TARGET_DIM || attTypmod === TARGET_DIM + 8;
   const dimCheck = await pool.query(`
     SELECT atttypmod
     FROM pg_attribute
@@ -50,8 +59,8 @@ export async function initDb(): Promise<void> {
       AND pg_attribute.attname = 'embedding'
       AND pg_attribute.attnum > 0
   `);
-  if (dimCheck.rows.length > 0 && dimCheck.rows[0].atttypmod !== TARGET_TYPMOD) {
-    console.log(`[db] Embedding dimension mismatch (typmod=${dimCheck.rows[0].atttypmod}, want ${TARGET_TYPMOD}), recreating marmot_chunks table...`);
+  if (dimCheck.rows.length > 0 && !isTargetVectorDims(dimCheck.rows[0].atttypmod)) {
+    console.log(`[db] Embedding dimension mismatch (typmod=${dimCheck.rows[0].atttypmod}, want vector(${TARGET_DIM})), recreating marmot_chunks table...`);
     await pool.query("DROP INDEX IF EXISTS marmot_chunks_embedding_idx");
     await pool.query("DROP TABLE IF EXISTS marmot_chunks");
   }
