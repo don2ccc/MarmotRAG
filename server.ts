@@ -324,15 +324,47 @@ async function initializeState(): Promise<void> {
   console.log(`[query-logs] Loaded ${store.queryLogs.length} recent log(s) from DB`);
 }
 
-// ── OpenAPI: the ONLY public endpoint is agent chunk retrieval ──────────
+// ── OpenAPI: the only public agent endpoints are ingest + retrieve ─────
 const OPENAPI = {
   openapi: "3.0.3",
   info: {
-    title: "Marmot RAG Retrieval API",
+    title: "MarmotRAG Agent API",
     version: "1.0.0",
-    description: "Retrieve relevant chunks from a shared knowledge base. Authenticate with X-API-Key.",
+    description: "Ingest new memories (chunk + embed + store) and retrieve relevant chunks from a shared knowledge base. Authenticate with X-API-Key.",
   },
   paths: {
+    "/api/agent/sources": {
+      post: {
+        summary: "Ingest a new memory/source (create-only)",
+        description: "Chunks, embeds, and stores the content as a new private source owned by the key's user. Re-sending an existing id returns 409 — agents may never overwrite knowledge; updates/deletes are dashboard-only.",
+        security: [{ ApiKeyAuth: [] }],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  id: { type: "string", description: "Optional caller-supplied id (create-only idempotency guard)" },
+                  name: { type: "string", description: "Optional display name (defaults to a content preview)" },
+                  type: { type: "string", description: "Optional source type (defaults to Agent Memory)" },
+                  content: { type: "string", description: "Text to chunk and embed" },
+                },
+                required: ["content"],
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "Source created and synced" },
+          "400": { description: "Missing/invalid content or id" },
+          "401": { description: "Missing or invalid X-API-Key" },
+          "409": { description: "id already exists (create-only)" },
+          "413": { description: "content too large" },
+          "429": { description: "Rate limit exceeded" },
+          "500": { description: "Embedding failed" },
+        },
+      },
+    },
     "/api/agent/retrieve": {
       post: {
         summary: "Retrieve relevant chunks for a query",
@@ -362,11 +394,16 @@ app.get("/api/openapi.json", (_req, res) => res.json(OPENAPI));
 app.get("/.well-known/openapi.json", (_req, res) => res.json(OPENAPI));
 app.get("/api/docs", (_req, res) => {
   res.setHeader("Content-Type", "text/html");
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Marmot RAG API</title></head>
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>MarmotRAG Agent API</title></head>
 <body style="font-family:system-ui;max-width:720px;margin:40px auto">
-<h1>Marmot RAG — Retrieval API</h1>
+<h1>MarmotRAG — Agent API</h1>
 <p>OpenAPI: <a href="/api/openapi.json">/api/openapi.json</a></p>
-<p>The only public endpoint:</p>
+<p>Public endpoints (X-API-Key):</p>
+<pre><code>POST /api/agent/sources
+X-API-Key: mrmk_...
+
+{ "id": "mem-...", "name": "optional", "content": "text to chunk + embed" }
+</code></pre>
 <pre><code>POST /api/agent/retrieve
 X-API-Key: mrmk_...
 

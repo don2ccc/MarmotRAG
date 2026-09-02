@@ -1,9 +1,13 @@
 import { Router } from "express";
 import { upsertAgentKey, deleteAgentKeyById, type PersistedUser } from "../db.js";
 import { retrieveCore } from "../retrieval.js";
+import { ingestText } from "../ingest.js";
 import { store, recordQueryLog } from "../store.js";
 import { createAgentAuth, denyIfNotOwner } from "../auth.js";
 import type { AgentApiKey, QueryLog } from "../types";
+
+/** Max content length for the sync ingest endpoint (memory-sized payloads). */
+const AGENT_WRITE_MAX_CONTENT = 50_000;
 
 function currentUser(req: any): PersistedUser {
   return req.user as PersistedUser;
@@ -138,6 +142,88 @@ export function createAgentRouter(): Router {
     } catch (err) {
       console.error("[agent/retrieve] failed:", err);
       res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
+    }
+  });
+
+  // ── Agent: ingest a new memory/source (create-only) ──────────────────
+  r.post("/agent/sources", agentAuth, async (req, res) => {
+    const key = (req as any).agentKey as AgentApiKey;
+    const { id, name, type, content } = req.body ?? {};
+
+    if (typeof content !== "string" || !content.trim()) {
+      res.status(400).json({ error: "content (string) is required" });
+      return;
+    }
+    const safeContent = content.trim();
+    if (safeContent.length > AGENT_WRITE_MAX_CONTENT) {
+      res.status(413).json({
+        error: `content exceeds maximum length of ${AGENT_WRITE_MAX_CONTENT} characters.`,
+      });
+      return;
+    }
+
+    // Optional caller-supplied id: create-only idempotency guard. If the id
+    // already exists we refuse (409) — agents may never overwrite knowledge.
+    let memoryId: string;
+    if (id !== undefined) {
+      if (typeof id !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) {
+        res.status(400).json({
+          error: "id must be 1-128 characters of letters, digits, '.', '_' or '-'.",
+        });
+        return;
+      }
+      if (store.sources.some(s => s.id === id)) {
+        res.status(409).json({
+          error: `A source with id "${id}" already exists. Agent writes are create-only; manage existing sources in the dashboard.`,
+        });
+        return;
+      }
+      memoryId = id;
+    } else {
+      memoryId = `mem-${crypto.randomUUID()}`;
+    }
+
+    const ownerName = store.users.find(u => u.id === key.ownerId)?.name ?? key.ownerId;
+    const displayName =
+      typeof name === "string" && name.trim()
+        ? name.trim().slice(0, 500)
+        : `Memory ${safeContent.slice(0, 40)}${safeContent.length > 40 ? "…" : ""}`;
+    const sourceType =
+      typeof type === "string" && type.trim() ? type.trim().slice(0, 200) : "Agent Memory";
+
+    try {
+      const result = await ingestText({
+        id: memoryId,
+        name: displayName,
+        type: sourceType,
+        content: safeContent,
+        ownerId: key.ownerId,
+        ownerName,
+        chunkSize: store.strategyConfig.chunkSize || 120,
+        chunkOverlap: store.strategyConfig.chunkOverlap || 15,
+        strategy: store.strategyConfig.separationStrategy || "Semantic",
+      });
+
+      // Ensure the writing key can retrieve what it just stored.
+      let sourceFilterUpdated = false;
+      if (key.sourceFilter.length > 0 && !key.sourceFilter.includes(result.sourceId)) {
+        key.sourceFilter.push(result.sourceId);
+        sourceFilterUpdated = true;
+        await upsertAgentKey({ ...key, monthStamp: key._monthStamp });
+      }
+
+      res.status(201).json({
+        sourceId: result.sourceId,
+        name: result.name,
+        chunkCount: result.chunkCount,
+        status: "Synced",
+        sourceFilterUpdated,
+      });
+    } catch (err) {
+      console.error("[agent/sources] failed:", err);
+      res.status(500).json({
+        error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?",
+      });
     }
   });
 

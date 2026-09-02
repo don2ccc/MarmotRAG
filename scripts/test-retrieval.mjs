@@ -16,6 +16,7 @@ const USER_B = "u-2"; // Marcus Kane
 let passed = 0;
 let failed = 0;
 let docId = "";
+let memId = "";
 let keyA = "";
 let keyB = "";
 
@@ -142,6 +143,42 @@ if (keyA) {
   ok("key A retrieve works", retrKeyA.status === 200);
 }
 
+// ── 7b. Agent API: ingest memories (create-only) ─────────────────────
+console.log("\n7b. Agent memory ingestion");
+if (keyA) {
+  const noAuthWrite = await req("/api/agent/sources", { method: "POST", body: { content: "x" } });
+  ok("missing X-API-Key on write → 401", noAuthWrite.status === 401);
+
+  const noContent = await req("/api/agent/sources", { method: "POST", apiKey: keyA, body: { id: "mem-itest" } });
+  ok("missing content → 400", noContent.status === 400);
+
+  const badId = await req("/api/agent/sources", { method: "POST", apiKey: keyA, body: { id: "has space", content: "x" } });
+  ok("invalid id format → 400", badId.status === 400, `status ${badId.status}`);
+
+  const write1 = await req("/api/agent/sources", {
+    method: "POST",
+    apiKey: keyA,
+    body: { id: `mem-itest-${Date.now()}`, name: "记忆测试", content: "记忆测试：用户喜欢吃川菜，尤其是麻婆豆腐。" },
+  });
+  ok("agent write → 201 Synced with chunks",
+    write1.status === 201 && write1.body.status === "Synced" && write1.body.chunkCount >= 1,
+    `status ${write1.status}`);
+  memId = write1.body.sourceId ?? "";
+
+  if (memId) {
+    const dup = await req("/api/agent/sources", { method: "POST", apiKey: keyA, body: { id: memId, content: "x" } });
+    ok("same id again → 409 (create-only)", dup.status === 409, `status ${dup.status}`);
+
+    const retrMem = await req("/api/agent/retrieve", { method: "POST", apiKey: keyA, body: { query: "麻婆豆腐", topK: 5 } });
+    ok("key A retrieves its own memory", (retrMem.body.chunks ?? []).some(c => c.sourceId === memId));
+
+    if (keyB) {
+      const retrMemB = await req("/api/agent/retrieve", { method: "POST", apiKey: keyB, body: { query: "麻婆豆腐", topK: 5 } });
+      ok("u-2's key cannot see u-1's memory", (retrMemB.body.chunks ?? []).every(c => c.sourceId !== memId));
+    }
+  }
+}
+
 if (docId && keyB) {
   const retrKeyB = await req("/api/agent/retrieve", { method: "POST", apiKey: keyB, body: { query: "国巨集团毛利率" } });
   ok("u-2's key cannot see u-1 private doc", (retrKeyB.body.chunks ?? []).every(c => c.sourceId !== docId));
@@ -152,6 +189,10 @@ console.log("\n8. Cleanup");
 if (docId) {
   const del = await req(`/api/sources/${docId}`, { method: "DELETE", userId: USER_A });
   ok("delete test doc", del.status === 200);
+}
+if (memId) {
+  const delMem = await req(`/api/sources/${memId}`, { method: "DELETE", userId: USER_A });
+  ok("owner deletes memory via dashboard", delMem.status === 200);
 }
 if (keyA) {
   const revoke = await req(`/api/agent/keys/${keyAres.body.id}`, { method: "DELETE", userId: USER_A });

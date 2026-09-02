@@ -6,6 +6,11 @@ MarmotRAG is a multi-user, shareable **knowledge retrieval service** — not a f
 2. **Embed** — each chunk is vectorized locally via Ollama (`qwen3-embedding:4b`).
 3. **Retrieve** — callers query the vector store through the API and get back the most relevant chunks with similarity scores.
 
+Both stages are exposed as API-key-protected endpoints, so external applications (e.g. an agentic app) can **store** memory snippets and later **fetch** the relevant chunks:
+
+- `POST /api/agent/sources` — ingest new content; the server chunks + embeds + stores it.
+- `POST /api/agent/retrieve` — fetch the most relevant stored chunks for a query.
+
 Callers bring their own LLM (or any downstream logic) if they want to generate answers from the retrieved chunks; that step happens entirely outside MarmotRAG.
 
 ---
@@ -20,6 +25,7 @@ Callers bring their own LLM (or any downstream logic) if they want to generate a
 | **Chunking** | Three strategies: Semantic, Fixed, Recursive — CJK-aware via `jieba-wasm`; global config (size/overlap) |
 | **Embedding** | Local Ollama (`qwen3-embedding:4b`, 2000-dim, Matryoshka truncation) |
 | **Vector Store** | PostgreSQL + `pgvector` with HNSW cosine index |
+| **Ingestion API** | `POST /api/agent/sources` stores a memory/document (create-only, idempotency guard via optional `id`) |
 | **Retrieval API** | `POST /api/agent/retrieve` returns chunks + scores (chunk retrieval only — no generation) |
 | **API Keys** | Per-user keys with `X-API-Key` auth, rate limiting, usage counters, per-key source scoping |
 | **Observability** | Retrieval query log with latency and retrieved chunks; dashboard stats |
@@ -148,7 +154,41 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 
 ### 8.2 Agent API (external, `X-API-Key`)
 
-**The only public endpoint is `POST /api/agent/retrieve`** — everything else in the system is dashboard-internal and not exposed to external callers. The endpoint returns the most relevant chunks only; it never generates an answer.
+There are two public endpoints, both authenticated with `X-API-Key`; everything else in the system is dashboard-internal and not exposed to external callers.
+
+**Ingest** — store new content (create-only). The server chunks, embeds, and stores it as a private source owned by the key's user:
+
+```bash
+curl -X POST http://localhost:3000/api/agent/sources \
+  -H "X-API-Key: mrmk_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "mem-user-pref-001",
+    "name": "User preference: concise replies",
+    "content": "The user mentioned they prefer short, direct answers."
+  }'
+```
+
+Response:
+
+```json
+{
+  "sourceId": "mem-user-pref-001",
+  "name": "User preference: concise replies",
+  "chunkCount": 1,
+  "status": "Synced",
+  "sourceFilterUpdated": false
+}
+```
+
+Ingest rules:
+
+- `content` is required (max 50,000 characters); `name` and `type` are optional.
+- The optional `id` is a **create-only idempotency guard**: re-sending an existing `id` returns `409` instead of overwriting.
+- Writes are **never updated or deleted through the Agent API** — managing knowledge (rename / share / pause / re-index / delete) is the owner's job and stays in the dashboard (owner-only).
+- The new source is added to the writing key's `sourceFilter`, so that key can always retrieve what it stored.
+
+**Retrieve** — fetch the most relevant chunks for a query:
 
 ```bash
 curl -X POST http://localhost:3000/api/agent/retrieve \
