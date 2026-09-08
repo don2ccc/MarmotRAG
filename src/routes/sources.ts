@@ -11,9 +11,39 @@ import { denyIfNotOwner } from "../auth.js";
 import type { Chunk, QueryLog, SourceDoc } from "../types";
 
 const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = requireCjs("pdf-parse");
+const mammoth = requireCjs("mammoth") as {
+  extractRawText(input: { buffer: Buffer }): Promise<{ value: string; messages: unknown[] }>;
+};
+const iconv = requireCjs("iconv-lite") as {
+  decode(buffer: Buffer, encoding: string): string;
+};
 
 function currentUser(req: any): PersistedUser {
   return req.user as PersistedUser;
+}
+
+/** Decode a text file: UTF-8 (with BOM handling), UTF-16, then GBK fallback. */
+function decodeTextBuffer(buffer: Buffer): string {
+  // UTF-8 BOM
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return buffer.subarray(3).toString("utf8");
+  }
+  // UTF-16 LE / BE BOM
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return buffer.subarray(2).toString("utf16le");
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return iconv.decode(buffer.subarray(2), "utf16-be");
+  }
+  // Strict UTF-8; Node replaces invalid sequences with U+FFFD, so fall back to
+  // GBK for ANSI/Chinese-encoded txt files.
+  const utf8 = buffer.toString("utf8");
+  if (!utf8.includes("\uFFFD")) return utf8;
+  return iconv.decode(buffer, "gbk");
+}
+
+function sanitizeText(text: string): string {
+  return text.replace(/\x00/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ").trim();
 }
 
 /** Sources the given user may see: own + shared. */
@@ -235,21 +265,56 @@ export function createSourcesRouter(): Router {
     res.end();
   });
 
-  // Parse a PDF and return extracted text.
-  r.post("/parse-pdf", async (req, res) => {
-    const { base64 } = req.body ?? {};
+  // Parse an uploaded document (PDF / TXT / DOCX) and return extracted text.
+  r.post("/parse-document", async (req, res) => {
+    const { base64, filename } = req.body ?? {};
     if (!base64 || typeof base64 !== "string") {
       res.status(400).json({ error: "base64 field is required." });
       return;
     }
+    const name = typeof filename === "string" && filename.trim() ? filename.trim() : "";
+    if (!name) {
+      res.status(400).json({ error: "filename field is required." });
+      return;
+    }
+    const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+
     try {
       const buffer = Buffer.from(base64, "base64");
-      const data = await pdfParse(buffer);
-      const cleanText = data.text.replace(/\x00/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ").trim();
-      res.json({ text: cleanText, pages: data.numpages });
+      switch (ext) {
+        case "pdf": {
+          const data = await pdfParse(buffer);
+          const text = sanitizeText(data.text);
+          if (!text) { res.status(422).json({ error: "No extractable text found in the PDF." }); return; }
+          res.json({ text, pages: data.numpages, format: "pdf" });
+          return;
+        }
+        case "txt":
+        case "text":
+        case "md":
+        case "markdown": {
+          const text = sanitizeText(decodeTextBuffer(buffer));
+          if (!text) { res.status(422).json({ error: "The text file is empty." }); return; }
+          res.json({ text, format: "text" });
+          return;
+        }
+        case "docx": {
+          const { value } = await mammoth.extractRawText({ buffer });
+          const text = sanitizeText(value);
+          if (!text) { res.status(422).json({ error: "No extractable text found in the DOCX." }); return; }
+          res.json({ text, format: "docx" });
+          return;
+        }
+        case "doc":
+          res.status(415).json({ error: "Legacy .doc files are not supported. Please save the file as .docx or paste the text." });
+          return;
+        default:
+          res.status(415).json({ error: "Unsupported file type. Supported formats: .pdf, .txt, .docx." });
+          return;
+      }
     } catch (err) {
-      console.error("[parse-pdf] Failed to parse PDF:", err);
-      res.status(422).json({ error: "Failed to parse PDF. Make sure the file is a valid PDF." });
+      console.error("[parse-document] Failed to parse document:", err);
+      res.status(422).json({ error: "Failed to parse the document. Make sure it is a valid file." });
     }
   });
 

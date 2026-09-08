@@ -20,7 +20,7 @@ Callers bring their own LLM (or any downstream logic) if they want to generate a
 | Category | Capability |
 |---|---|
 | **Multi-user** | Demo identity via `X-User-Id` (session/JWT-ready); every user sees only their own + shared documents |
-| **Document management** | PDF upload (text extraction via `pdf-parse`), plain-text paste, 50 MB limit, re-index, pause, rename, delete, chunk preview |
+| **Document management** | PDF / TXT / DOCX upload (auto text extraction), plain-text paste, 50 MB limit, re-index, pause, rename, delete, chunk preview |
 | **Sharing** | Per-document private/shared toggle — shared documents are visible to every user and every API key |
 | **Chunking** | Three strategies: Semantic, Fixed, Recursive — CJK-aware via `jieba-wasm`; global config (size/overlap) |
 | **Embedding** | Local Ollama (`qwen3-embedding:4b`, 2000-dim, Matryoshka truncation) |
@@ -144,7 +144,7 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 | `POST` | `/api/sources/:id/reindex` | Re-chunk and re-embed (owner only, SSE) |
 | `DELETE` | `/api/sources/:id` | Delete source + vectors (owner only) |
 | `GET` | `/api/sources/:id/chunks` | Chunk preview (visible sources) |
-| `POST` | `/api/parse-pdf` | Extract text from Base64 PDF |
+| `POST` | `/api/parse-document` | Extract text from Base64 PDF / TXT / DOCX (`base64` + `filename`) |
 | `POST` | `/api/retrieve` | Retrieve chunks (Playground, no generation) |
 | `GET/POST` | `/api/config` | Global chunking config |
 | `GET` | `/api/stats` | Dashboard stats for current user |

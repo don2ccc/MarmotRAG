@@ -41,8 +41,8 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 
-// 50MB limit for PDF uploads; all other JSON limited to 2MB
-app.use("/api/parse-pdf", express.json({ limit: "50mb" }));
+// 50MB limit for document uploads (PDF/TXT/DOCX); all other JSON limited to 2MB
+app.use("/api/parse-document", express.json({ limit: "50mb" }));
 app.use(express.json({ limit: "2mb" }));
 
 // HTTP request logging — concise in dev, combined in production

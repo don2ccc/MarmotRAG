@@ -93,7 +93,7 @@ export default function KnowledgeBaseTab(props: Props) {
   const [newDocName, setNewDocName] = useState("");
   const [newDocType, setNewDocType] = useState("Text Document");
   const [newDocContent, setNewDocContent] = useState("");
-  const [isPdfParsing, setIsPdfParsing] = useState(false);
+  const [isFileParsing, setIsFileParsing] = useState(false);
   const [isEmbedding, setIsEmbedding] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -107,9 +107,9 @@ export default function KnowledgeBaseTab(props: Props) {
     ? sources.filter(s => s.name.toLowerCase().includes(search.toLowerCase()) || s.type.toLowerCase().includes(search.toLowerCase()))
     : sources;
 
-  const handlePdfUpload = async (file: File) => {
+  const handleFileUpload = async (file: File) => {
     if (!file) return;
-    setIsPdfParsing(true);
+    setIsFileParsing(true);
     try {
       const base64 = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -120,18 +120,25 @@ export default function KnowledgeBaseTab(props: Props) {
         reader.onerror = () => reject(new Error("read failed"));
         reader.readAsDataURL(file);
       });
-      const res = await apiFetch(userId, "/api/parse-pdf", {
+      const res = await apiFetch(userId, "/api/parse-document", {
         method: "POST",
-        body: JSON.stringify({ base64 }),
+        body: JSON.stringify({ base64, filename: file.name }),
       });
-      if (!res.ok) throw new Error("parse failed");
       const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "parse failed");
       setNewDocContent(data.text);
-      showToast(`PDF parsed — ${data.pages} page(s).`, "success");
-    } catch {
-      showToast("Failed to parse PDF.", "error");
+      setNewDocType(data.format === "pdf" ? "PDF Collection" : "Text Document");
+      if (data.format === "pdf") {
+        showToast(`PDF parsed — ${data.pages} page(s).`, "success");
+      } else if (data.format === "docx") {
+        showToast("DOCX text extracted.", "success");
+      } else {
+        showToast("Text file loaded.", "success");
+      }
+    } catch (err: any) {
+      showToast(err.message || "Failed to parse the document.", "error");
     } finally {
-      setIsPdfParsing(false);
+      setIsFileParsing(false);
     }
   };
 
@@ -451,19 +458,19 @@ export default function KnowledgeBaseTab(props: Props) {
               {["Text Document", "PDF Collection", "Notion Webhook", "G-Drive Archive", "API Connector"].map(t => <option key={t} value={t}>{t}</option>)}
             </select>
             <div>
-              <input ref={fileInputRef} type="file" accept="application/pdf" className="hidden"
-                onChange={e => { const f = e.target.files?.[0]; if (f) handlePdfUpload(f); e.target.value = ""; }} />
+              <input ref={fileInputRef} type="file" accept=".pdf,.txt,.docx" className="hidden"
+                onChange={e => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.target.value = ""; }} />
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={isPdfParsing}
+                disabled={isFileParsing}
                 className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-dashed border-white/15 rounded text-[10px] font-mono text-white/50 uppercase tracking-wider hover:border-[#86C9A4]/40 hover:text-[#86C9A4] disabled:opacity-50 cursor-pointer"
               >
-                <Upload className="w-4 h-4" /> {isPdfParsing ? "Parsing PDF…" : "Upload PDF (auto-extract text)"}
+                <Upload className="w-4 h-4" /> {isFileParsing ? "Parsing…" : "Upload PDF / TXT / DOCX (auto-extract text)"}
               </button>
             </div>
             <textarea
-              value={newDocContent} onChange={e => setNewDocContent(e.target.value)} placeholder="Paste text here, or upload a PDF above to auto-fill…" required
+              value={newDocContent} onChange={e => setNewDocContent(e.target.value)} placeholder="Paste text here, or upload PDF/TXT/DOCX above to auto-fill…" required
               rows={8}
               className="w-full p-2.5 bg-[#0E1218] border border-white/10 rounded text-xs text-white placeholder-white/40 focus:outline-none focus:ring-1 focus:ring-[#86C9A4] font-mono resize-y"
             />
