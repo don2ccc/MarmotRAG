@@ -109,6 +109,10 @@ export default function KnowledgeBaseTab(props: Props) {
 
   const handleFileUpload = async (file: File) => {
     if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      showToast("File exceeds the 50 MB limit.", "error");
+      return;
+    }
     setIsFileParsing(true);
     try {
       const base64 = await new Promise<string>((resolve, reject) => {

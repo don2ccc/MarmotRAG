@@ -41,8 +41,11 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 
-// 50MB limit for document uploads (PDF/TXT/DOCX); all other JSON limited to 2MB
-app.use("/api/parse-document", express.json({ limit: "50mb" }));
+// Large JSON bodies for document parsing and indexing — the product allows
+// 50 MB files, and base64 inflates to ~4/3, so leave headroom. All other JSON
+// stays at 2MB.
+app.use("/api/parse-document", express.json({ limit: "100mb" }));
+app.use("/api/sources", express.json({ limit: "100mb" }));
 app.use(express.json({ limit: "2mb" }));
 
 // HTTP request logging — concise in dev, combined in production
@@ -454,6 +457,10 @@ async function startServer() {
   // Global error handler — catches unhandled errors thrown by route handlers
   app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error("[error]", err.stack ?? err.message);
+    if ((err as { type?: string }).type === "entity.too.large") {
+      res.status(413).json({ error: "File too large. Maximum upload size is 50 MB." });
+      return;
+    }
     res.status(500).json({ error: "Internal server error." });
   });
 
