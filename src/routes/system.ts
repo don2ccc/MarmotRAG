@@ -5,7 +5,7 @@ import {
 } from "../db.js";
 import { store } from "../store.js";
 import { visibleSources } from "./sources.js";
-import { embedRuntimeConfig } from "../embeddings.js";
+import { embedRuntimeConfig, probeEmbeddingServer } from "../embeddings.js";
 
 function currentUser(req: any): PersistedUser {
   return req.user as PersistedUser;
@@ -17,16 +17,10 @@ export function createSystemRouter(): Router {
   r.get("/health", async (req, res) => {
     let pgConnected = false;
     try { await pingDb(); pgConnected = true; } catch { /* offline */ }
-    // Probe the endpoint the embedding client actually uses (env-driven), not
-    // the possibly-stale value persisted in the DB config.
+    // Probe the endpoint the embedding client actually uses (env-driven), with
+    // the endpoint that matches its protocol.
     const { ollamaBaseUrl } = embedRuntimeConfig();
-    let ollamaConnected = false;
-    try {
-      const resp = await fetch(`${ollamaBaseUrl}/api/tags`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      ollamaConnected = resp.ok;
-    } catch { /* offline */ }
+    const ollamaConnected = await probeEmbeddingServer();
     res.json({
       status: pgConnected && ollamaConnected ? "healthy" : "degraded",
       pgConnected,
@@ -40,8 +34,13 @@ export function createSystemRouter(): Router {
   // Ollama endpoint + embedding model are owned by the environment (.env); the
   // dashboard must display those, not whatever older value sits in the DB.
   const withRuntimeEmbedding = () => {
-    const { ollamaBaseUrl, embedModel } = embedRuntimeConfig();
-    return { ...store.strategyConfig, ollamaBaseUrl, embeddingModel: embedModel };
+    const { ollamaBaseUrl, embedModel, api } = embedRuntimeConfig();
+    return {
+      ...store.strategyConfig,
+      ollamaBaseUrl,
+      embeddingModel: embedModel,
+      embeddingProvider: api === "openai" ? "OpenAI-compatible" : "Ollama (Local)",
+    };
   };
 
   r.get("/config", (_req, res) => res.json(withRuntimeEmbedding()));
@@ -52,6 +51,7 @@ export function createSystemRouter(): Router {
     const body = { ...(req.body ?? {}) } as Record<string, unknown>;
     delete body.ollamaBaseUrl;
     delete body.embeddingModel;
+    delete body.embeddingProvider;
     store.strategyConfig = { ...store.strategyConfig, ...body } as typeof store.strategyConfig;
     await saveConfig(store.strategyConfig as unknown as Record<string, unknown>);
     res.json({ message: "Configuration saved successfully", config: withRuntimeEmbedding() });

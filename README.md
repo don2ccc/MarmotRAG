@@ -120,6 +120,9 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 | `PG_DATABASE` | `ai_hub` | Yes | Database name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Yes | Ollama API base URL |
 | `OLLAMA_EMBED_MODEL` | `qwen3-embedding:4b` | No | Ollama embedding model name (must exist locally) |
+| `EMBED_API` | `ollama` | No | Wire protocol of the embedding server: `ollama` or `openai` (LM Studio / vLLM / OpenAI-compatible) |
+| `EMBED_BASE_URL` | — | No | Overrides `OLLAMA_BASE_URL`; for OpenAI-compatible servers include the version prefix (e.g. `http://localhost:1234/v1`) |
+| `EMBED_API_KEY` | — | No | Bearer token, only used when `EMBED_API=openai` |
 | `PORT` | `3000` | No | HTTP port |
 | `CORS_ORIGINS` | `*` | No | Allowed origins (comma-separated) |
 

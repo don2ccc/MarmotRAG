@@ -352,7 +352,8 @@ export function createSourcesRouter(): Router {
       res.json(result);
     } catch (err) {
       console.error("[retrieve] failed:", err);
-      res.status(500).json({ error: "Embedding failed. Is Ollama running with qwen3-embedding:4b?" });
+      const reason = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: `Embedding failed: ${reason}` });
     }
   });
 

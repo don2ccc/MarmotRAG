@@ -196,7 +196,7 @@ const DEFAULT_STRATEGY_CONFIG = {
   embeddingProvider: "Ollama (Local)",
   embeddingModel: process.env.OLLAMA_EMBED_MODEL || "qwen3-embedding:4b",
   embeddingDimension: 2000,
-  ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+  ollamaBaseUrl: process.env.EMBED_BASE_URL || process.env.OLLAMA_BASE_URL || "http://localhost:11434",
 };
 
 /**
