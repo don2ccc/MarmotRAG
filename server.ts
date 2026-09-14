@@ -194,7 +194,7 @@ const DEFAULT_STRATEGY_CONFIG = {
   pgDatabase: process.env.PG_DATABASE || "ai_hub",
   pgTable: "marmot_chunks",
   embeddingProvider: "Ollama (Local)",
-  embeddingModel: "qwen3-embedding:4b",
+  embeddingModel: process.env.OLLAMA_EMBED_MODEL || "qwen3-embedding:4b",
   embeddingDimension: 2000,
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
 };

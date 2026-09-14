@@ -119,6 +119,7 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 | `PG_PASSWORD` | — | Yes | PostgreSQL password |
 | `PG_DATABASE` | `ai_hub` | Yes | Database name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Yes | Ollama API base URL |
+| `OLLAMA_EMBED_MODEL` | `qwen3-embedding:4b` | No | Ollama embedding model name (must exist locally) |
 | `PORT` | `3000` | No | HTTP port |
 | `CORS_ORIGINS` | `*` | No | Allowed origins (comma-separated) |
 

@@ -5,6 +5,7 @@ import {
 } from "../db.js";
 import { store } from "../store.js";
 import { visibleSources } from "./sources.js";
+import { embedRuntimeConfig } from "../embeddings.js";
 
 function currentUser(req: any): PersistedUser {
   return req.user as PersistedUser;
@@ -16,9 +17,12 @@ export function createSystemRouter(): Router {
   r.get("/health", async (req, res) => {
     let pgConnected = false;
     try { await pingDb(); pgConnected = true; } catch { /* offline */ }
+    // Probe the endpoint the embedding client actually uses (env-driven), not
+    // the possibly-stale value persisted in the DB config.
+    const { ollamaBaseUrl } = embedRuntimeConfig();
     let ollamaConnected = false;
     try {
-      const resp = await fetch(`${store.strategyConfig.ollamaBaseUrl}/api/tags`, {
+      const resp = await fetch(`${ollamaBaseUrl}/api/tags`, {
         signal: AbortSignal.timeout(3000),
       });
       ollamaConnected = resp.ok;
@@ -29,16 +33,28 @@ export function createSystemRouter(): Router {
       ollamaConnected,
       pgHost: store.strategyConfig.pgHost,
       pgDatabase: store.strategyConfig.pgDatabase,
-      ollamaBaseUrl: store.strategyConfig.ollamaBaseUrl,
+      ollamaBaseUrl,
     });
   });
 
-  r.get("/config", (_req, res) => res.json(store.strategyConfig));
+  // Ollama endpoint + embedding model are owned by the environment (.env); the
+  // dashboard must display those, not whatever older value sits in the DB.
+  const withRuntimeEmbedding = () => {
+    const { ollamaBaseUrl, embedModel } = embedRuntimeConfig();
+    return { ...store.strategyConfig, ollamaBaseUrl, embeddingModel: embedModel };
+  };
+
+  r.get("/config", (_req, res) => res.json(withRuntimeEmbedding()));
 
   r.post("/config", async (req, res) => {
-    store.strategyConfig = { ...store.strategyConfig, ...(req.body ?? {}) };
+    // Embedding settings are env-controlled — ignore them here so a stale
+    // value can never be stored and shown as if it were in effect.
+    const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+    delete body.ollamaBaseUrl;
+    delete body.embeddingModel;
+    store.strategyConfig = { ...store.strategyConfig, ...body } as typeof store.strategyConfig;
     await saveConfig(store.strategyConfig as unknown as Record<string, unknown>);
-    res.json({ message: "Configuration saved successfully", config: store.strategyConfig });
+    res.json({ message: "Configuration saved successfully", config: withRuntimeEmbedding() });
   });
 
   r.get("/stats", (_req, res) => {

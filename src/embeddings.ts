@@ -1,7 +1,12 @@
 /**
- * Local embedding via Ollama qwen3-embedding:4b.
- * Ollama must be running and the model must be pulled:
+ * Local embedding via Ollama (default model: qwen3-embedding:4b).
+ * Ollama must be running and the model must be available locally:
  *   ollama pull qwen3-embedding:4b
+ *
+ * Both settings come from the environment and can be overridden in .env:
+ *   OLLAMA_BASE_URL   — Ollama API base URL
+ *   OLLAMA_EMBED_MODEL — model name to embed with (any locally available
+ *                        embedding model, e.g. a custom GGUF import)
  *
  * Raw output dimension: 2560
  * Stored dimension: 2000 (truncated — pgvector ivfflat max is 2000 dims)
@@ -11,8 +16,26 @@
  * Multilingual: native Chinese (simplified + traditional), English, 100+ languages
  */
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-const EMBED_MODEL = "qwen3-embedding:4b";
+// Read env lazily (at call time), NOT at module load: dotenv.config() runs
+// after the imports are evaluated, so module-level reads would silently ignore
+// .env values and always fall back to the defaults.
+function ollamaBaseUrl(): string {
+  return process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+}
+
+/** Ollama model name for embeddings — override with OLLAMA_EMBED_MODEL. */
+function embedModel(): string {
+  return process.env.OLLAMA_EMBED_MODEL || "qwen3-embedding:4b";
+}
+
+/**
+ * The Ollama endpoint + model the embedding client actually uses right now.
+ * Single source of truth for anything that reports embedding settings
+ * (health check, dashboard config) so the UI never disagrees with reality.
+ */
+export function embedRuntimeConfig(): { ollamaBaseUrl: string; embedModel: string } {
+  return { ollamaBaseUrl: ollamaBaseUrl(), embedModel: embedModel() };
+}
 // pgvector ivfflat hard limit is 2000 dims; truncate the 2560-dim output here.
 const STORE_DIM = 2000;
 
@@ -45,10 +68,10 @@ function sanitizeForEmbed(text: string): string {
  */
 async function embedTextOnce(text: string): Promise<number[]> {
   const clean = sanitizeForEmbed(text);
-  const response = await fetch(`${OLLAMA_BASE_URL}/api/embeddings`, {
+  const response = await fetch(`${ollamaBaseUrl()}/api/embeddings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: EMBED_MODEL, prompt: clean }),
+    body: JSON.stringify({ model: embedModel(), prompt: clean }),
     signal: AbortSignal.timeout(30_000), // 30s timeout per chunk
   });
 
