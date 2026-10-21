@@ -8,7 +8,6 @@ import { apiFetch } from "./api";
 import DashboardTab from "./tabs/DashboardTab";
 import WorkspaceTab from "./tabs/WorkspaceTab";
 import KnowledgeBaseTab from "./tabs/KnowledgeBaseTab";
-import AdminTab from "./tabs/AdminTab";
 import PlaygroundTab from "./tabs/PlaygroundTab";
 import ApiAccessTab from "./tabs/ApiAccessTab";
 import type { IndexingProgress, SourceDoc, TabType, UserInfo } from "./types";
@@ -19,7 +18,6 @@ const NAV: { tab: TabType; label: string; icon: React.ComponentType<{ className?
   { tab: "playground", label: "Retrieval Lab", icon: Flame },
   { tab: "api-access", label: "Agent API", icon: Key },
   { tab: "workspace", label: "Workspace", icon: Sliders },
-  { tab: "admin", label: "Users", icon: Shield },
 ];
 
 export default function App() {
@@ -344,7 +342,6 @@ export default function App() {
             showConfirm={showConfirm}
           />
         )}
-        {activeTab === "admin" && <AdminTab userId={currentUserId} showToast={showToast} showConfirm={showConfirm} />}
         {activeTab === "playground" && <PlaygroundTab userId={currentUserId} showToast={showToast} />}
         {activeTab === "api-access" && (
           <ApiAccessTab userId={currentUserId} sources={sources} showToast={showToast} showConfirm={showConfirm} />

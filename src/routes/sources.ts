@@ -100,6 +100,9 @@ export function createSourcesRouter(): Router {
             lifecycle: state.lifecycle,
             effectiveFrom: state.effectiveFrom,
             effectiveTo: state.effectiveTo,
+            collectionId: state.collectionId,
+            collectionName: state.collectionName,
+            tags: state.tags,
             lastError: state.lastError,
           }
         : doc;
