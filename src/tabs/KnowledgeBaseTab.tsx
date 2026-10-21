@@ -69,7 +69,11 @@ function subscribeToIndexSSE(
             setIndexingProgress(p => { const n = { ...p }; delete n[docId]; return n; });
             resolve();
           } else if (event === "error") {
-            setSources(prev => prev.map(s => s.id === docId ? { ...s, status: "Auth Error" } : s));
+            // A failed re-index keeps the previous build serving, so the server
+            // reports status "Synced" alongside the error. Only a source that
+            // never had a successful build becomes "Auth Error".
+            const nextStatus = data.status === "Synced" ? "Synced" : "Auth Error";
+            setSources(prev => prev.map(s => s.id === docId ? { ...s, status: nextStatus } : s));
             setIndexingProgress(p => { const n = { ...p }; delete n[docId]; return n; });
             reject(new Error(data.message));
           }
@@ -343,6 +347,21 @@ export default function KnowledgeBaseTab(props: Props) {
                           <FileText className="w-4 h-4 text-[#86C9A4] shrink-0" />
                           <div className="min-w-0">
                             <p className="text-xs font-bold text-white truncate max-w-[240px]">{s.name}</p>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              {typeof s.versionNo === "number" && (
+                                <span className="font-mono text-[8px] uppercase tracking-wider text-[#86C9A4]/80 border border-[#86C9A4]/20 rounded px-1">
+                                  v{s.versionNo}
+                                </span>
+                              )}
+                              {s.kind && (
+                                <span className="font-mono text-[8px] uppercase tracking-wider text-white/35">{s.kind}</span>
+                              )}
+                              {s.effectiveTo && new Date(s.effectiveTo).getTime() < Date.now() && (
+                                <span className="font-mono text-[8px] uppercase tracking-wider text-yellow-300 border border-yellow-300/30 rounded px-1">
+                                  expired
+                                </span>
+                              )}
+                            </div>
                             {progress && (
                               <div className="flex items-center gap-2 mt-1">
                                 <div className="w-24 h-1 bg-white/10 rounded overflow-hidden">

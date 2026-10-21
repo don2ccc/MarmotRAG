@@ -1,14 +1,16 @@
 import { Router } from "express";
 import { requireCjs } from "../cjs.js";
 import {
-  upsertSource, deleteSource, deleteChunksBySource, upsertChunk, loadChunksBySource,
+  upsertSource, deleteSource, deleteChunksBySource, loadChunksBySource,
+  renameChunksSourceName, isVersionBuilding, loadVersionStates,
+  updateSourceMeta, updateCurrentVersionValidity, getSourceDetail,
   type PersistedUser,
 } from "../db.js";
-import { chunkText, retrieveCore } from "../retrieval.js";
-import { embedText } from "../embeddings.js";
+import { retrieveCore } from "../retrieval.js";
+import { indexSource, planChunks, policyFromConfig } from "../indexing.js";
 import { store, recordQueryLog } from "../store.js";
 import { denyIfNotOwner } from "../auth.js";
-import type { Chunk, QueryLog, SourceDoc } from "../types";
+import type { QueryLog, SourceDoc } from "../types";
 
 const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = requireCjs("pdf-parse");
 const mammoth = requireCjs("mammoth") as {
@@ -46,6 +48,17 @@ function sanitizeText(text: string): string {
   return text.replace(/\x00/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ").trim();
 }
 
+const ALLOWED_KINDS = new Set(["policy", "process", "contract", "template", "annex", "memory", "document"]);
+const ALLOWED_LIFECYCLES = new Set(["effective", "draft", "expired", "revoked"]);
+
+function parseDate(value: unknown, field: string): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) throw new Error(`${field} must be an ISO date or null.`);
+  return date.toISOString();
+}
+
 /** Sources the given user may see: own + shared. */
 export function visibleSources(userId: string): SourceDoc[] {
   return store.sources.filter(s => s.ownerId === userId || s.isShared);
@@ -55,7 +68,9 @@ export function createSourcesRouter(): Router {
   const r = Router();
 
   // List visible sources (own + shared), with optional in-memory pagination/search.
-  r.get("/sources", (req, res) => {
+  // Version/validity fields are projected from the DB (the in-memory cache only
+  // holds document metadata).
+  r.get("/sources", async (req, res) => {
     const user = currentUser(req);
     const search = typeof req.query.search === "string" ? req.query.search.trim().toLowerCase() : "";
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
@@ -64,7 +79,28 @@ export function createSourcesRouter(): Router {
     if (search) list = list.filter(s => s.name.toLowerCase().includes(search) || s.type.toLowerCase().includes(search));
     const total = list.length;
     const page = list.slice(offset, offset + limit);
-    res.json({ sources: page, total, limit, offset });
+
+    let versionById = new Map<string, Awaited<ReturnType<typeof loadVersionStates>>[number]>();
+    try {
+      versionById = new Map((await loadVersionStates()).map(s => [s.id, s]));
+    } catch (err) {
+      console.warn("[sources] version projection failed:", err);
+    }
+    const enriched = page.map(doc => {
+      const state = versionById.get(doc.id);
+      return state
+        ? {
+            ...doc,
+            kind: state.kind,
+            docNo: state.docNo,
+            versionNo: state.versionNo,
+            lifecycle: state.lifecycle,
+            effectiveFrom: state.effectiveFrom,
+            effectiveTo: state.effectiveTo,
+          }
+        : doc;
+    });
+    res.json({ sources: enriched, total, limit, offset });
   });
 
   // Chunk preview for a visible source.
@@ -80,27 +116,78 @@ export function createSourcesRouter(): Router {
     res.json({ sourceId: doc.id, sourceName: doc.name, chunks });
   });
 
-  // Rename/update metadata or share toggle — owner only.
+  // Rename/update metadata, validity or share toggle — owner only.
   r.patch("/sources/:id", async (req, res) => {
     const user = currentUser(req);
     const doc = store.sources.find(d => d.id === req.params.id);
     if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
     if (denyIfNotOwner(doc.ownerId, req as any, res)) return;
 
-    const { name, type, status, isShared } = req.body ?? {};
+    const {
+      name, type, status, isShared, kind, docNo,
+      lifecycle, effectiveFrom, effectiveTo, signedAt,
+    } = req.body ?? {};
+
+    let dates: {
+      effectiveFrom?: string | null;
+      effectiveTo?: string | null;
+      signedAt?: string | null;
+    };
+    try {
+      dates = {
+        effectiveFrom: parseDate(effectiveFrom, "effectiveFrom"),
+        effectiveTo: parseDate(effectiveTo, "effectiveTo"),
+        signedAt: parseDate(signedAt, "signedAt"),
+      };
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Invalid date." });
+      return;
+    }
+
+    if (kind !== undefined && !ALLOWED_KINDS.has(String(kind))) {
+      res.status(400).json({ error: `kind must be one of: ${[...ALLOWED_KINDS].join(", ")}` });
+      return;
+    }
+    if (lifecycle !== undefined && !ALLOWED_LIFECYCLES.has(String(lifecycle))) {
+      res.status(400).json({ error: `lifecycle must be one of: ${[...ALLOWED_LIFECYCLES].join(", ")}` });
+      return;
+    }
+
     if (name !== undefined) doc.name = String(name).slice(0, 500).trim();
     if (type !== undefined) doc.type = String(type).slice(0, 200).trim();
     if (status !== undefined && ["Synced", "Paused", "Auth Error"].includes(status)) {
       doc.status = status;
     }
     if (typeof isShared === "boolean") doc.isShared = isShared;
+    if (kind !== undefined) doc.kind = String(kind);
+    if (docNo !== undefined) doc.docNo = docNo === null ? null : String(docNo).slice(0, 200);
 
     await upsertSource({
       id: doc.id, name: doc.name, type: doc.type, status: doc.status, lastSync: doc.lastSync,
       vectorsCount: doc.vectorsCount, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
       isShared: doc.isShared, content: doc.content,
     });
-    res.json({ id: doc.id, name: doc.name, type: doc.type, status: doc.status, isShared: doc.isShared });
+    // Document-level metadata lives on the document row; validity lives on the
+    // version currently being served.
+    await updateSourceMeta(doc.id, { kind: doc.kind, docNo: doc.docNo });
+    await updateCurrentVersionValidity(doc.id, { lifecycle, ...dates });
+    // source_name is denormalized onto chunks; keep search results in sync.
+    await renameChunksSourceName(doc.id, doc.name);
+
+    const detail = await getSourceDetail(doc.id).catch(() => null);
+    res.json({
+      id: doc.id,
+      name: doc.name,
+      type: doc.type,
+      status: doc.status,
+      isShared: doc.isShared,
+      kind: detail?.kind ?? doc.kind,
+      docNo: detail?.docNo ?? doc.docNo ?? null,
+      versionNo: detail?.versionNo ?? null,
+      lifecycle: detail?.lifecycle ?? null,
+      effectiveFrom: detail?.effectiveFrom ?? null,
+      effectiveTo: detail?.effectiveTo ?? null,
+    });
   });
 
   // Delete a source and its chunks — owner only.
@@ -119,42 +206,28 @@ export function createSourcesRouter(): Router {
     res.json({ message: "Source deleted" });
   });
 
-  /** Embed all chunks for a doc, streaming SSE progress events. */
-  async function embedAndStoreChunks(
-    docId: string,
-    docName: string,
-    rawChunks: string[],
-    send: (event: string, data: unknown) => void
-  ): Promise<Chunk[]> {
-    const chunksData: Chunk[] = [];
-    for (let i = 0; i < rawChunks.length; i++) {
-      const text = rawChunks[i];
-      let embedding: number[];
-      try {
-        embedding = await embedText(text);
-      } catch (err) {
-        console.error(`[embed] chunk ${i} failed: ${err}`);
-        throw new Error(`Ollama embed failed on chunk ${i}: ${err}`);
-      }
-      const chunk: Chunk = { id: `${docId}-chk-${i}`, sourceId: docId, sourceName: docName, text, tokensCount: text.split(/\s+/).length, embedding };
-      chunksData.push(chunk);
-      await upsertChunk(chunk as Required<Chunk>);
-      send("progress", { done: i + 1, total: rawChunks.length });
-    }
-    return chunksData;
-  }
-
   // Add a new document — SSE stream with progress.
   r.post("/sources", async (req, res) => {
     const user = currentUser(req);
-    const { name, content, type } = req.body ?? {};
+    const { name, content, type, kind, docNo } = req.body ?? {};
     if (!name || !content) {
       res.status(400).json({ error: "Name and content are required." });
+      return;
+    }
+    if (kind !== undefined && !ALLOWED_KINDS.has(String(kind))) {
+      res.status(400).json({ error: `kind must be one of: ${[...ALLOWED_KINDS].join(", ")}` });
       return;
     }
     const existing = store.sources.find(d => d.name.trim().toLowerCase() === String(name).trim().toLowerCase());
     if (existing) {
       res.status(409).json({ error: `A document named "${name}" already exists. Delete it first or use Re-index to update it.` });
+      return;
+    }
+
+    const policy = policyFromConfig(store.strategyConfig);
+    const planned = planChunks(content, policy);
+    if (planned.length === 0) {
+      res.status(422).json({ error: "The document produced no chunks." });
       return;
     }
 
@@ -165,56 +238,72 @@ export function createSourcesRouter(): Router {
     const send = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
     const id = `src-${Date.now()}`;
-    const rawChunks = chunkText(
-      content,
-      store.strategyConfig.chunkSize || 120,
-      store.strategyConfig.chunkOverlap || 15,
-      store.strategyConfig.separationStrategy || "Semantic"
-    );
     const newDoc: SourceDoc = {
       id, name: String(name).slice(0, 500), type: type || "Text Document", status: "Syncing...",
-      lastSync: "Just now", vectorsCount: rawChunks.length, ownerId: user.id, ownerName: user.name,
+      lastSync: "", vectorsCount: 0, ownerId: user.id, ownerName: user.name,
       isShared: false, content, chunks: [],
+      kind: kind ?? "document",
+      docNo: docNo === undefined || docNo === null ? null : String(docNo).slice(0, 200),
     };
 
+    // The row has to exist before the shadow build starts: beginVersion() reads
+    // and claims it. status stays "Syncing..." because there is nothing to serve.
     await upsertSource({
-      id, name: newDoc.name, type: newDoc.type, status: newDoc.status, lastSync: newDoc.lastSync,
-      vectorsCount: newDoc.vectorsCount, owner: user.name, ownerAvatar: "", ownerId: user.id,
+      id, name: newDoc.name, type: newDoc.type, status: "Syncing...", lastSync: "",
+      vectorsCount: 0, owner: user.name, ownerAvatar: "", ownerId: user.id,
       isShared: false, content,
     });
+    await updateSourceMeta(id, { kind: newDoc.kind, docNo: newDoc.docNo ?? null });
     store.sources.unshift(newDoc);
-    send("start", { doc: { ...newDoc, chunks: [] }, total: rawChunks.length });
+    send("start", { doc: { ...newDoc, chunks: [] }, total: planned.length });
 
     try {
-      const chunksData = await embedAndStoreChunks(id, newDoc.name, rawChunks, send);
-      newDoc.chunks = chunksData;
-      newDoc.vectorsCount = chunksData.length;
-      newDoc.status = "Synced";
-      newDoc.lastSync = new Date().toLocaleTimeString("en-US", { hour12: false });
-      await upsertSource({
-        id, name: newDoc.name, type: newDoc.type, status: "Synced", lastSync: newDoc.lastSync,
-        vectorsCount: newDoc.vectorsCount, owner: user.name, ownerAvatar: "", ownerId: user.id,
-        isShared: false, content,
+      const result = await indexSource({
+        sourceId: id,
+        sourceName: newDoc.name,
+        content,
+        chunkSize: policy.chunkSize,
+        chunkOverlapPercent: policy.chunkOverlapPercent,
+        strategy: policy.strategy,
+        onProgress: (done, total) => send("progress", { done, total }),
       });
+      newDoc.status = "Synced";
+      newDoc.vectorsCount = result.chunkCount;
+      newDoc.lastSync = result.lastSync;
       send("done", { doc: { ...newDoc, chunks: [] } });
     } catch (err) {
+      // abortVersion() already dropped the partial version and, because this
+      // document never had an active version, switched the DB status to "Auth Error".
       newDoc.status = "Auth Error";
       newDoc.vectorsCount = 0;
-      await upsertSource({
-        id, name: newDoc.name, type: newDoc.type, status: "Auth Error", lastSync: newDoc.lastSync,
-        vectorsCount: 0, owner: user.name, ownerAvatar: "", ownerId: user.id, isShared: false, content,
-      }).catch(() => {});
-      send("error", { message: String(err) });
+      console.error("[sources/create] indexing failed:", err);
+      send("error", { message: String(err), status: "Auth Error" });
     }
     res.end();
   });
 
   // Re-index an existing source — owner only, SSE stream.
+  //
+  // The chunks that are currently served stay untouched until the new build
+  // commits, so retrieval keeps answering from the old snapshot for the whole
+  // rebuild, and a failure records an error without removing knowledge.
   r.post("/sources/:id/reindex", async (req, res) => {
     const user = currentUser(req);
     const doc = store.sources.find(d => d.id === req.params.id);
     if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
     if (denyIfNotOwner(doc.ownerId, req as any, res)) return;
+
+    if (await isVersionBuilding(doc.id)) {
+      res.status(409).json({ error: "A re-index is already running for this document." });
+      return;
+    }
+
+    const policy = policyFromConfig(store.strategyConfig);
+    const planned = planChunks(doc.content, policy);
+    if (planned.length === 0) {
+      res.status(422).json({ error: "This document has no content to index." });
+      return;
+    }
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -222,45 +311,36 @@ export function createSourcesRouter(): Router {
     res.flushHeaders();
     const send = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
-    doc.status = "Syncing...";
-    const rawChunks = chunkText(
-      doc.content,
-      store.strategyConfig.chunkSize || 120,
-      store.strategyConfig.chunkOverlap || 15,
-      store.strategyConfig.separationStrategy || "Semantic"
-    );
-    try { await deleteChunksBySource(req.params.id); } catch (err) {
-      console.warn("[reindex] pgvector cleanup failed:", err);
-    }
-    // Persist the in-flight status so a crash/restart mid-embed can be
-    // detected and healed at next startup (see initializeState).
-    await upsertSource({
-      id: doc.id, name: doc.name, type: doc.type, status: "Syncing...", lastSync: doc.lastSync,
-      vectorsCount: doc.vectorsCount, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
-      isShared: doc.isShared, content: doc.content,
-    });
-    send("start", { doc: { ...doc, chunks: [] }, total: rawChunks.length });
+    // A re-index must not silently reset editorial validity: the new version
+    // inherits the dates/lifecycle of the version it replaces.
+    const current = await getSourceDetail(doc.id).catch(() => null);
+
+    send("start", { doc: { ...doc, chunks: [] }, total: planned.length });
 
     try {
-      const chunksData = await embedAndStoreChunks(doc.id, doc.name, rawChunks, send);
-      doc.chunks = chunksData;
-      doc.vectorsCount = chunksData.length;
-      doc.status = "Synced";
-      doc.lastSync = new Date().toLocaleTimeString("en-US", { hour12: false });
-      await upsertSource({
-        id: doc.id, name: doc.name, type: doc.type, status: "Synced", lastSync: doc.lastSync,
-        vectorsCount: doc.vectorsCount, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
-        isShared: doc.isShared, content: doc.content,
+      const result = await indexSource({
+        sourceId: doc.id,
+        sourceName: doc.name,
+        content: doc.content,
+        chunkSize: policy.chunkSize,
+        chunkOverlapPercent: policy.chunkOverlapPercent,
+        strategy: policy.strategy,
+        lifecycle: current?.lifecycle ?? undefined,
+        effectiveFrom: current?.effectiveFrom ?? null,
+        effectiveTo: current?.effectiveTo ?? null,
+        signedAt: current?.signedAt ?? null,
+        onProgress: (done, total) => send("progress", { done, total }),
       });
+      doc.status = "Synced";
+      doc.vectorsCount = result.chunkCount;
+      doc.lastSync = result.lastSync;
+      doc.versionNo = result.versionNo;
       send("done", { doc: { ...doc, chunks: [] } });
     } catch (err) {
-      doc.status = "Auth Error";
-      await upsertSource({
-        id: doc.id, name: doc.name, type: doc.type, status: "Auth Error", lastSync: doc.lastSync,
-        vectorsCount: doc.vectorsCount, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
-        isShared: doc.isShared, content: doc.content,
-      }).catch(() => {});
-      send("error", { message: String(err) });
+      // The previous build is still active, so the source stays searchable.
+      doc.status = "Synced";
+      console.error("[sources/reindex] build failed, previous build kept:", err);
+      send("error", { message: String(err), status: "Synced" });
     }
     res.end();
   });
@@ -321,7 +401,9 @@ export function createSourcesRouter(): Router {
   // Internal retrieval for the Playground (authenticated by resolveUser).
   r.post("/retrieve", async (req, res) => {
     const user = currentUser(req);
-    const { query, topK, minScore, sourceFilter } = req.body ?? {};
+    const {
+      query, topK, minScore, sourceFilter, kinds, docIds, asOf, includeExpired, mode, diversity,
+    } = req.body ?? {};
     if (!query || typeof query !== "string" || !query.trim()) {
       res.status(400).json({ error: "Query is required" });
       return;
@@ -337,23 +419,37 @@ export function createSourcesRouter(): Router {
         topK: typeof topK === "number" ? topK : undefined,
         minScore: typeof minScore === "number" ? minScore : undefined,
         sourceFilter: Array.isArray(sourceFilter) ? sourceFilter : undefined,
+        kinds: Array.isArray(kinds) ? kinds.filter((k: unknown) => typeof k === "string") : undefined,
+        docIds: Array.isArray(docIds) ? docIds.filter((d: unknown) => typeof d === "string") : undefined,
+        asOf: typeof asOf === "string" ? asOf : null,
+        includeExpired: includeExpired === true,
+        mode: (["fast", "balanced", "deep"] as const).includes(mode) ? mode : undefined,
+        diversity: typeof diversity === "number" ? diversity : undefined,
       });
       const log: QueryLog = {
-        id: `log-${Date.now()}`,
+        id: `log-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
         query,
         userId: user.id,
         via: "user",
         latencyMs: result.latencyMs,
-        status: result.chunks.length > 0 ? "success" : "error",
-        retrievedChunks: result.chunks.map(c => ({ chunkId: c.chunkId, sourceName: c.sourceName, text: c.text, score: c.score })),
+        status: result.status,
+        retrievalId: result.retrievalId,
+        diagnostics: result.diagnostics,
+        retrievedChunks: result.chunks.map(c => ({
+          chunkId: c.chunkId,
+          citationId: c.citationId,
+          sourceName: c.sourceName,
+          text: c.text,
+          score: c.score,
+        })),
       };
       recordQueryLog(log);
       res.json(result);
     } catch (err) {
       console.error("[retrieve] failed:", err);
       const reason = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `Embedding failed: ${reason}` });
+      res.status(500).json({ error: `Retrieval failed: ${reason}` });
     }
   });
 

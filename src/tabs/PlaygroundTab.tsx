@@ -98,6 +98,23 @@ export default function PlaygroundTab({ userId, showToast }: Props) {
             </div>
           </div>
 
+          <div className="flex flex-wrap items-center gap-2 font-mono text-[9px] text-white/50">
+            <span className={`px-2 py-1 rounded uppercase tracking-wider font-bold ${
+              result.status === "hit" ? "bg-[#86C9A4]/15 text-[#86C9A4]"
+              : result.status === "weak" ? "bg-yellow-500/15 text-yellow-400"
+              : "bg-white/10 text-white/50"
+            }`}>{result.status}</span>
+            <span>vector {result.diagnostics.vectorHits}</span>
+            <span>lexical {result.diagnostics.lexicalHits}</span>
+            <span>fused {result.diagnostics.fused}</span>
+            <span>dup {result.diagnostics.deduped}</span>
+            {result.diagnostics.degraded && <span className="text-yellow-400">degraded</span>}
+            {result.diagnostics.lexicalKeys.length > 0 && (
+              <span className="text-white/35">keys: {result.diagnostics.lexicalKeys.join(", ")}</span>
+            )}
+            <span className="text-white/30">{result.retrievalId}</span>
+          </div>
+
           {result.chunks.length === 0 ? (
             <div className="bg-[#131720] border border-white/10 rounded-xl p-8 text-center">
               <FileText className="w-6 h-6 text-white/20 mx-auto mb-3" />
@@ -114,7 +131,9 @@ export default function PlaygroundTab({ userId, showToast }: Props) {
                   <span className="font-mono text-[9px] text-white/45 w-6">#{i + 1}</span>
                   <div className="min-w-0 flex-1">
                     <p className="text-xs font-bold text-white truncate">{c.sourceName}</p>
-                    <p className="font-mono text-[9px] text-white/45 truncate">{c.chunkId} · {c.tokenCount} tokens</p>
+                    <p className="font-mono text-[9px] text-white/45 truncate">
+                      {c.clausePath ?? c.clauseNo ?? c.chunkId} · v{c.versionNo} · {c.tokenCount} tokens
+                    </p>
                   </div>
                   <span className={`px-2 py-1 rounded font-mono text-[10px] font-bold ${
                     c.score >= 0.7 ? "bg-[#86C9A4]/15 text-[#86C9A4]" :

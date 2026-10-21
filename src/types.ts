@@ -19,6 +19,14 @@ export interface SourceDoc {
   isShared: boolean;
   content: string;
   chunks: Chunk[];
+  /** policy | process | contract | template | annex | memory | document */
+  kind?: string;
+  docNo?: string | null;
+  /** Current version number and its editorial validity (read-only projection). */
+  versionNo?: number | null;
+  lifecycle?: string | null;
+  effectiveFrom?: string | null;
+  effectiveTo?: string | null;
 }
 
 /** Query log — retrieval only (no answer, no scores). */
@@ -32,13 +40,20 @@ export interface QueryLog {
   /** "user" for playground queries, "agent:<label>" for API key calls. */
   via: string;
   latencyMs: number;
-  status: "success" | "error";
-  retrievedChunks: { chunkId: string; sourceName: string; text: string; score: number }[];
+  /** hit = usable, weak = low confidence, empty = nothing found, error = failed. */
+  status: "success" | "error" | "hit" | "weak" | "empty";
+  /** Stable id handed back to the caller; feedback references it. */
+  retrievalId?: string | null;
+  diagnostics?: unknown;
+  retrievedChunks: { chunkId: string; citationId?: string; sourceName: string; text: string; score: number }[];
 }
 
 export interface StrategyConfig {
   chunkSize: number;
+  /** Percentage of chunkSize (0-50). Legacy configs used a token count. */
   chunkOverlap: number;
+  /** "percent" (current) or "tokens" (legacy, migrated on load). */
+  chunkOverlapUnit?: "percent" | "tokens";
   separationStrategy: string;
   // Local pgvector store
   pgHost: string;
@@ -118,16 +133,56 @@ export interface SystemStats {
 }
 
 /** POST /api/retrieve or /api/agent/retrieve response. */
+export interface Citation {
+  citationId: string;
+  chunkId: string;
+  docId: string;
+  docNo: string | null;
+  kind: string;
+  title: string;
+  versionNo: number;
+  clauseNo: string | null;
+  clausePath: string | null;
+  page: number | null;
+  charRange: [number, number] | null;
+  effectiveFrom: string | null;
+  effectiveTo: string | null;
+  lifecycle: string;
+  score: number;
+}
+
+export interface RetrievalDiagnostics {
+  vectorHits: number;
+  lexicalHits: number;
+  fused: number;
+  returned: number;
+  deduped: number;
+  bestScore: number;
+  scoreGap: number;
+  degraded: boolean;
+  reranked: boolean;
+  lexicalKeys: string[];
+  tookMs: number;
+}
+
 export interface RetrieveResult {
   query: string;
+  retrievalId: string;
+  status: "hit" | "weak" | "empty";
+  citations: Citation[];
   chunks: {
+    citationId: string;
     chunkId: string;
     sourceId: string;
     sourceName: string;
     text: string;
     score: number;
     tokenCount: number;
+    versionNo: number;
+    clauseNo: string | null;
+    clausePath: string | null;
   }[];
   context: string;
+  diagnostics: RetrievalDiagnostics;
   latencyMs: number;
 }

@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+# temporary compile targets used by the test scripts
+.tmp-build/
+.tmp-server/
+.tmp-tsconfig.json

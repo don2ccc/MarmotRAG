@@ -6,14 +6,14 @@ import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import {
-  initDb, upsertChunk, upsertSource, loadSources, countSources, countChunks, deleteChunksBySource,
+  initDb, upsertSource, loadSources, countSources,
   loadConfig, saveConfig,
+  loadVersionStates, recoverInterruptedVersions, listRebuildCandidates,
   loadAgentKeys, upsertAgentKey, countAgentKeys,
   loadQueryLogs, insertQueryLog, queryLogsPaginated,
   loadUsers, upsertUser, countUsers, closePool,
 } from "./src/db.js";
-import { embedText } from "./src/embeddings.js";
-import { chunkText } from "./src/retrieval.js";
+import { indexSource, policyFromConfig } from "./src/indexing.js";
 import { createResolveUser } from "./src/auth.js";
 import { store } from "./src/store.js";
 import { createSourcesRouter } from "./src/routes/sources.js";
@@ -187,8 +187,14 @@ const SEED_AGENT_KEYS: AgentApiKey[] = [
 // ── Default strategy config (chunking only) ──────────────────────────────
 const DEFAULT_STRATEGY_CONFIG = {
   chunkSize: 200,
-  chunkOverlap: 20,
-  separationStrategy: "Semantic",
+  // Percentage of chunkSize (matches the dashboard label). Older installs
+  // stored a token count here; initializeState() converts those once.
+  chunkOverlap: 10,
+  chunkOverlapUnit: "percent" as const,
+  // Clause-aware by default: 制度/合同 are indexed one clause per chunk with
+  // clause_no/clause_path, which is what citations need. Documents without
+  // clause markers fall back to sentence packing automatically.
+  separationStrategy: "Clause",
   pgHost: process.env.PG_HOST || "127.0.0.1",
   pgPort: process.env.PG_PORT || "5432",
   pgDatabase: process.env.PG_DATABASE || "ai_hub",
@@ -217,28 +223,28 @@ async function initializeState(): Promise<void> {
   const existing = await countSources();
   if (existing === 0) {
     console.log("[sources] Empty DB — seeding initial documents...");
+    const policy = policyFromConfig(DEFAULT_STRATEGY_CONFIG);
     for (const doc of SEED_SOURCES) {
       const owner = store.users.find(u => u.id === doc.ownerId);
       const ownerName = owner?.name ?? doc.ownerName;
       await upsertSource({
-        id: doc.id, name: doc.name, type: doc.type, status: doc.status, lastSync: doc.lastSync,
-        vectorsCount: doc.vectorsCount, owner: ownerName, ownerAvatar: "",
+        id: doc.id, name: doc.name, type: doc.type, status: "Syncing...", lastSync: "",
+        vectorsCount: 0, owner: ownerName, ownerAvatar: "",
         ownerId: doc.ownerId, isShared: doc.isShared, content: doc.content,
       });
-      // Embed seed chunks
-      const rawChunks = chunkText(doc.content, 120, 15, "Semantic");
-      for (let idx = 0; idx < rawChunks.length; idx++) {
-        try {
-          const embedding = await embedText(rawChunks[idx]);
-          await upsertChunk({
-            id: `${doc.id}-chk-${idx}`, sourceId: doc.id, sourceName: doc.name,
-            text: rawChunks[idx], tokensCount: rawChunks[idx].split(/\s+/).length, embedding,
-          });
-        } catch (err) {
-          console.warn(`[seed] embed failed for ${doc.id}-chk-${idx}:`, err);
-        }
+      try {
+        const result = await indexSource({
+          sourceId: doc.id,
+          sourceName: doc.name,
+          content: doc.content,
+          chunkSize: policy.chunkSize,
+          chunkOverlapPercent: policy.chunkOverlapPercent,
+          strategy: policy.strategy,
+        });
+        console.log(`[seed] Embedded: ${doc.name} (${result.chunkCount} chunks)`);
+      } catch (err) {
+        console.warn(`[seed] embed failed for ${doc.id}:`, err);
       }
-      console.log(`[seed] Embedded: ${doc.name}`);
     }
   }
   const rows = await loadSources();
@@ -253,54 +259,68 @@ async function initializeState(): Promise<void> {
   });
   console.log(`[sources] Loaded ${store.sources.length} source(s) from DB`);
 
-  // Heal interrupted indexing jobs: a "Syncing..." status at boot means the
-  // previous process died mid-embed (e.g. server restart). Mark the source
-  // Paused, drop its partial chunks and zero the vector count so the user
-  // can re-index cleanly instead of seeing a permanently stuck status.
-  const interrupted = store.sources.filter(s => s.status === "Syncing...");
-  for (const doc of interrupted) {
-    console.warn(`[sources] Healed interrupted indexing for "${doc.name}" (${doc.id}) — marked Paused, partial chunks dropped`);
-    doc.status = "Paused";
-    doc.vectorsCount = 0;
-    try { await deleteChunksBySource(doc.id); } catch (err) {
-      console.warn(`[sources] Failed to clean partial chunks for ${doc.id}:`, err);
-    }
-    await upsertSource({
-      id: doc.id, name: doc.name, type: doc.type, status: "Paused", lastSync: doc.lastSync,
-      vectorsCount: 0, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
-      isShared: doc.isShared, content: doc.content,
-    });
+  // ── Repair version state left behind by a crash ───────────────────────
+  // A version that was `building` at boot can never be resumed: its chunks are
+  // incomplete. Drop those chunks, mark the version failed, and clear pointers
+  // to versions that are no longer active. Documents without a servable version
+  // are queued for rebuild from their retained content — the previous behaviour
+  // deleted every chunk and marked the document Paused, silently losing knowledge.
+  const recovery = await recoverInterruptedVersions();
+  if (recovery.interrupted > 0) {
+    console.warn(`[sources] recovered ${recovery.interrupted} interrupted version build(s) — partial chunks dropped`);
   }
-  if (interrupted.length > 0) {
-    console.log(`[sources] Healed ${interrupted.length} interrupted indexing job(s)`);
+  if (recovery.cleared > 0) {
+    console.warn(`[sources] cleared ${recovery.cleared} document(s) pointing at a non-active version`);
   }
 
-  // If marmot_chunks is empty but we have synced sources, mark them for reindex.
-  const chunkTotal = await countChunks();
-  if (chunkTotal === 0 && store.sources.length > 0) {
-    console.warn("[sources] marmot_chunks is empty — marking all sources as needing reindex");
-    for (const doc of store.sources) {
-      if (doc.status === "Synced") {
-        doc.status = "Paused";
-        await upsertSource({
-          id: doc.id, name: doc.name, type: doc.type, status: "Paused", lastSync: doc.lastSync,
-          vectorsCount: 0, owner: doc.ownerName, ownerAvatar: "", ownerId: doc.ownerId,
-          isShared: doc.isShared, content: doc.content,
-        });
-      }
+  for (const state of await loadVersionStates()) {
+    if (state.currentVersionId || state.contentLength === 0) continue;
+    const doc = store.sources.find(s => s.id === state.id);
+    if (doc) {
+      doc.status = "Paused";
+      doc.vectorsCount = 0;
     }
+    console.warn(`[sources] "${state.name}" has no servable version — queued for rebuild`);
   }
 
   // Strategy config
   const savedCfg = await loadConfig();
   if (savedCfg) {
-    store.strategyConfig = { ...DEFAULT_STRATEGY_CONFIG, ...savedCfg } as typeof DEFAULT_STRATEGY_CONFIG;
+    const merged = { ...DEFAULT_STRATEGY_CONFIG, ...savedCfg } as typeof DEFAULT_STRATEGY_CONFIG & { chunkOverlapUnit?: string };
+    // Older builds stored chunkOverlap as a token count while the dashboard
+    // labelled it a percentage. Convert once so the effective overlap is kept.
+    if (merged.chunkOverlapUnit !== "percent") {
+      const legacyTokens = Number((savedCfg as Record<string, unknown>).chunkOverlap ?? 15);
+      const percent = Math.max(0, Math.min(50, Math.round((legacyTokens / Math.max(1, merged.chunkSize)) * 100)));
+      merged.chunkOverlap = percent;
+      merged.chunkOverlapUnit = "percent";
+      await saveConfig(merged as unknown as Record<string, unknown>);
+      console.log(`[config] migrated chunkOverlap ${legacyTokens} tokens → ${percent}%`);
+    }
+    // Clause-aware chunking is the point of this deployment (制度/合同), but a
+    // stored "Recursive"/"Semantic" from an older build was never a deliberate
+    // choice for this corpus. Migrate once, then leave the operator's later
+    // choice alone (the marker records that the migration already happened).
+    if ((savedCfg as Record<string, unknown>).chunkStrategyMigrated !== true) {
+      if (merged.separationStrategy !== "Clause") {
+        console.log(`[config] migrating separation strategy ${merged.separationStrategy} → Clause (re-index to apply)`);
+      }
+      merged.separationStrategy = "Clause";
+      (merged as unknown as Record<string, unknown>).chunkStrategyMigrated = true;
+      await saveConfig(merged as unknown as Record<string, unknown>);
+    }
+    store.strategyConfig = merged as typeof DEFAULT_STRATEGY_CONFIG;
     console.log("[config] Loaded strategy config from DB");
   } else {
     store.strategyConfig = { ...DEFAULT_STRATEGY_CONFIG };
     await saveConfig(store.strategyConfig as unknown as Record<string, unknown>);
     console.log("[config] Seeded default strategy config to DB");
   }
+
+  // Re-embed documents with no servable version in the background: startup must
+  // not block on the embedding server, and a failure leaves the document
+  // rebuildable instead of gone.
+  void rebuildMissingVersions();
 
   // Agent keys
   const keyCount = await countAgentKeys();
@@ -327,19 +347,79 @@ async function initializeState(): Promise<void> {
   console.log(`[query-logs] Loaded ${store.queryLogs.length} recent log(s) from DB`);
 }
 
-// ── OpenAPI: the only public agent endpoints are ingest + retrieve ─────
+/**
+ * Re-embed every document that has no servable version (embedding-dimension
+ * change, interrupted build, rows written before vectors were maintained). Runs
+ * after startup, one document at a time, so the service is available immediately
+ * and one failure cannot block the rest.
+ */
+async function rebuildMissingVersions(): Promise<void> {
+  let candidates: { id: string; name: string }[];
+  try {
+    candidates = await listRebuildCandidates();
+  } catch (err) {
+    console.error("[sources] could not list rebuild candidates:", err);
+    return;
+  }
+  if (candidates.length === 0) return;
+  console.log(`[sources] rebuilding ${candidates.length} stale source(s) in the background`);
+
+  for (const candidate of candidates) {
+    const doc = store.sources.find(s => s.id === candidate.id);
+    if (!doc || !doc.content) continue;
+    const policy = policyFromConfig(store.strategyConfig);
+    try {
+      const result = await indexSource({
+        sourceId: doc.id,
+        sourceName: doc.name,
+        content: doc.content,
+        chunkSize: policy.chunkSize,
+        chunkOverlapPercent: policy.chunkOverlapPercent,
+        strategy: policy.strategy,
+      });
+      doc.status = "Synced";
+      doc.vectorsCount = result.chunkCount;
+      doc.lastSync = result.lastSync;
+      console.log(`[sources] rebuilt "${doc.name}" (${result.chunkCount} chunks)`);
+    } catch (err) {
+      console.error(`[sources] rebuild failed for "${candidate.name}":`, err);
+    }
+  }
+}
+
+// ── OpenAPI for the public agent surface ───────────────────────────────
 const OPENAPI = {
   openapi: "3.0.3",
   info: {
     title: "MarmotRAG Agent API",
-    version: "1.0.0",
-    description: "Ingest new memories (chunk + embed + store) and retrieve relevant chunks from a shared knowledge base. Authenticate with X-API-Key.",
+    version: "1.1.0",
+    description:
+      "Versioned knowledge base for agents: chunk + embed + store with clause-aware " +
+      "citations, controlled updates (optimistic concurrency), as-of retrieval, and " +
+      "usage feedback. Authenticate with X-API-Key.",
   },
   paths: {
+    "/api/agent/sources/{id}": {
+      get: {
+        summary: "Read one document with its current version",
+        description: "Returns content plus versionNo, contentSha256, kind, docNo and validity dates. Use it before an update to obtain the current version.",
+        security: [{ ApiKeyAuth: [] }],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": { description: "Document detail" },
+          "404": { description: "Not found or not visible to this key" },
+        },
+      },
+    },
     "/api/agent/sources": {
       post: {
-        summary: "Ingest a new memory/source (create-only)",
-        description: "Chunks, embeds, and stores the content as a new private source owned by the key's user. Re-sending an existing id returns 409 — agents may never overwrite knowledge; updates/deletes are dashboard-only.",
+        summary: "Create or update a document (versioned upsert)",
+        description:
+          "Creates version 1 when the id is new (201). To update an existing document send " +
+          "expectedVersion (or If-Match) equal to its current versionNo; the new content " +
+          "becomes version N+1 and the previous version stops being served (200). A stale " +
+          "expectedVersion returns 409 with the current version. Identical content updates " +
+          "metadata/validity in place without re-embedding.",
         security: [{ ApiKeyAuth: [] }],
         requestBody: {
           content: {
@@ -347,10 +427,17 @@ const OPENAPI = {
               schema: {
                 type: "object",
                 properties: {
-                  id: { type: "string", description: "Optional caller-supplied id (create-only idempotency guard)" },
-                  name: { type: "string", description: "Optional display name (defaults to a content preview)" },
-                  type: { type: "string", description: "Optional source type (defaults to Agent Memory)" },
+                  id: { type: "string", description: "Stable document id (letters, digits, . _ -)" },
+                  name: { type: "string" },
+                  type: { type: "string", description: "Free-form source type label" },
                   content: { type: "string", description: "Text to chunk and embed" },
+                  expectedVersion: { type: "integer", description: "Required for updates; enables optimistic concurrency" },
+                  kind: { type: "string", enum: ["policy", "process", "contract", "template", "annex", "memory", "document"] },
+                  docNo: { type: "string", description: "文号 / 合同编号" },
+                  lifecycle: { type: "string", enum: ["effective", "draft", "expired", "revoked"] },
+                  effectiveFrom: { type: "string", format: "date-time" },
+                  effectiveTo: { type: "string", format: "date-time" },
+                  signedAt: { type: "string", format: "date-time" },
                 },
                 required: ["content"],
               },
@@ -358,25 +445,74 @@ const OPENAPI = {
           },
         },
         responses: {
-          "201": { description: "Source created and synced" },
-          "400": { description: "Missing/invalid content or id" },
+          "200": { description: "Updated (new version, or metadata-only)" },
+          "201": { description: "Created" },
+          "400": { description: "Invalid content, id, kind, lifecycle or dates" },
           "401": { description: "Missing or invalid X-API-Key" },
-          "409": { description: "id already exists (create-only)" },
+          "409": { description: "Missing or stale expectedVersion" },
           "413": { description: "content too large" },
           "429": { description: "Rate limit exceeded" },
-          "500": { description: "Embedding failed" },
+          "500": { description: "Embedding failed (the previous version keeps serving)" },
         },
       },
     },
     "/api/agent/retrieve": {
       post: {
-        summary: "Retrieve relevant chunks for a query",
+        summary: "Retrieve citable chunks",
         security: [{ ApiKeyAuth: [] }],
-        requestBody: { content: { "application/json": { schema: { type: "object", properties: { query: { type: "string" }, topK: { type: "number" }, minScore: { type: "number" }, sourceFilter: { type: "array", items: { type: "string" } } } } } } },
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  query: { type: "string" },
+                  topK: { type: "number", description: "1-50, default 5" },
+                  minScore: { type: "number", description: "0-1, default 0" },
+                  sourceFilter: { type: "array", items: { type: "string" } },
+                  kinds: { type: "array", items: { type: "string" } },
+                  docIds: { type: "array", items: { type: "string" } },
+                  asOf: { type: "string", format: "date-time", description: "Retrieve the version effective at that moment" },
+                  includeExpired: { type: "boolean" },
+                  mode: { type: "string", enum: ["fast", "balanced", "deep"] },
+                  diversity: { type: "number", description: "0 = relevance only, 1 = maximum diversity" },
+                },
+                required: ["query"],
+              },
+            },
+          },
+        },
         responses: {
-          "200": { description: "Chunks with scores" },
+          "200": { description: "citations[], context, status (hit|weak|empty), retrievalId, diagnostics" },
           "401": { description: "Missing or invalid X-API-Key" },
           "429": { description: "Rate limit exceeded" },
+        },
+      },
+    },
+    "/api/agent/feedback": {
+      post: {
+        summary: "Report which citations were used and whether they held up",
+        security: [{ ApiKeyAuth: [] }],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  retrievalId: { type: "string" },
+                  usedCitationIds: { type: "array", items: { type: "string" }, description: "e.g. [\"c1\",\"c3\"]" },
+                  verdict: { type: "string", enum: ["grounded", "partial", "unsupported"] },
+                  missingInfo: { type: "string" },
+                },
+                required: ["retrievalId", "verdict"],
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "Recorded" },
+          "400": { description: "Invalid retrievalId or verdict" },
+          "404": { description: "Unknown retrievalId" },
         },
       },
     },

@@ -1,5 +1,5 @@
 import type { AgentApiKey, QueryLog, SourceDoc, StrategyConfig } from "./types";
-import { insertQueryLog, type PersistedUser } from "./db";
+import { insertQueryLog, type PersistedUser } from "./db.js";
 
 /**
  * In-memory runtime state, loaded/seeded from Postgres at startup.

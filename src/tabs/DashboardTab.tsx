@@ -136,7 +136,12 @@ export default function DashboardTab({ userId }: Props) {
                     onClick={() => setExpanded(e => ({ ...e, [l.id]: !open }))}
                     className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors cursor-pointer text-left"
                   >
-                    <span className={`w-2 h-2 rounded-full shrink-0 ${l.status === "success" ? "bg-[#86C9A4]" : "bg-red-400"}`} />
+                    <span className={`w-2 h-2 rounded-full shrink-0 ${
+                      l.status === "error" ? "bg-red-400"
+                      : l.status === "empty" ? "bg-white/25"
+                      : l.status === "weak" ? "bg-yellow-400"
+                      : "bg-[#86C9A4]"
+                    }`} />
                     <div className="min-w-0 flex-1">
                       <p className="text-xs font-bold text-white truncate">{l.query}</p>
                       <p className="font-mono text-[9px] text-white/45">

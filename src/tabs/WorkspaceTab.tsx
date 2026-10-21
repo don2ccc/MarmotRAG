@@ -113,7 +113,7 @@ export default function WorkspaceTab({ userId, showToast }: Props) {
         <div className="space-y-2">
           <label className="font-mono text-[10px] text-white/50 uppercase tracking-wider font-bold">Separation Strategy</label>
           <div className="grid grid-cols-3 gap-2">
-            {["Semantic", "Fixed", "Recursive"].map(s => (
+            {["Clause", "Semantic", "Paragraph", "Fixed", "Recursive"].map(s => (
               <button
                 key={s}
                 onClick={() => change("separationStrategy", s)}

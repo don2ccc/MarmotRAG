@@ -1,13 +1,27 @@
 import { Router } from "express";
-import { upsertAgentKey, deleteAgentKeyById, type PersistedUser } from "../db.js";
-import { retrieveCore } from "../retrieval.js";
+import {
+  getSourceDetail,
+  upsertAgentKey,
+  deleteAgentKeyById,
+  updateSourceMeta,
+  updateCurrentVersionValidity,
+  insertFeedback,
+  retrievalExists,
+  type PersistedUser,
+  type SourceDetail,
+} from "../db.js";
+import { retrieveCore, type RetrievalMode } from "../retrieval.js";
 import { ingestText } from "../ingest.js";
 import { store, recordQueryLog } from "../store.js";
-import { createAgentAuth, denyIfNotOwner } from "../auth.js";
+import { createAgentAuth } from "../auth.js";
 import type { AgentApiKey, QueryLog } from "../types";
 
 /** Max content length for the sync ingest endpoint (memory-sized payloads). */
 const AGENT_WRITE_MAX_CONTENT = 50_000;
+
+const ALLOWED_KINDS = new Set(["policy", "process", "contract", "template", "annex", "memory", "document"]);
+const ALLOWED_LIFECYCLES = new Set(["effective", "draft", "expired", "revoked"]);
+const ALLOWED_VERDICTS = new Set(["grounded", "partial", "unsupported"]);
 
 function currentUser(req: any): PersistedUser {
   return req.user as PersistedUser;
@@ -32,6 +46,31 @@ export function maskKey(key: string): string {
 function toPublic(k: AgentApiKey) {
   const { key: _secret, _monthStamp: _ms, ...pub } = k;
   return pub;
+}
+
+/** ISO timestamp from a date-ish string; throws on an unparseable value. */
+function parseDate(value: unknown, field: string): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`${field} must be an ISO date or null.`);
+  }
+  return date.toISOString();
+}
+
+function parseVersion(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const n = Number(String(value).replace(/^W\//, "").replace(/"/g, ""));
+  return Number.isFinite(n) ? Math.trunc(n) : undefined;
+}
+
+/** Agent keys may only read documents their key is allowed to see. */
+function keyCanSee(key: AgentApiKey, detail: SourceDetail): boolean {
+  const visible = detail.ownerId === key.ownerId || detail.isShared;
+  if (!visible) return false;
+  if (key.sourceFilter.length === 0) return true;
+  return key.sourceFilter.includes(detail.id);
 }
 
 export function createAgentRouter(): Router {
@@ -106,10 +145,29 @@ export function createAgentRouter(): Router {
     res.json({ message: "Key revoked" });
   });
 
+  // ── Agent: read one document (read-modify-write support) ─────────────
+  r.get("/agent/sources/:id", agentAuth, async (req, res) => {
+    const key = (req as any).agentKey as AgentApiKey;
+    try {
+      const detail = await getSourceDetail(req.params.id);
+      if (!detail || !keyCanSee(key, detail)) {
+        res.status(404).json({ error: "Source not found" });
+        return;
+      }
+      res.json(detail);
+    } catch (err) {
+      console.error("[agent/sources:get] failed:", err);
+      res.status(500).json({ error: "Failed to load source." });
+    }
+  });
+
   // ── Agent: retrieve chunks (the core API) ────────────────────────────
   r.post("/agent/retrieve", agentAuth, async (req, res) => {
     const key = (req as any).agentKey as AgentApiKey;
-    const { query, topK, minScore, sourceFilter } = req.body ?? {};
+    const {
+      query, topK, minScore, sourceFilter, kinds, docIds, asOf, includeExpired, mode, diversity,
+    } = req.body ?? {};
+
     if (!query || typeof query !== "string" || !query.trim()) {
       res.status(400).json({ error: "query (string) is required" });
       return;
@@ -118,6 +176,7 @@ export function createAgentRouter(): Router {
       res.status(400).json({ error: "Query exceeds maximum length of 10,000 characters." });
       return;
     }
+
     try {
       const result = await retrieveCore({
         query,
@@ -126,30 +185,89 @@ export function createAgentRouter(): Router {
         minScore: typeof minScore === "number" ? minScore : undefined,
         sourceFilter: Array.isArray(sourceFilter) ? sourceFilter : undefined,
         extraSourceFilter: key.sourceFilter,
+        kinds: Array.isArray(kinds) ? kinds.filter((k: unknown) => typeof k === "string") : undefined,
+        docIds: Array.isArray(docIds) ? docIds.filter((d: unknown) => typeof d === "string") : undefined,
+        asOf: typeof asOf === "string" ? asOf : null,
+        includeExpired: includeExpired === true,
+        mode: (["fast", "balanced", "deep"] as RetrievalMode[]).includes(mode) ? mode : undefined,
+        diversity: typeof diversity === "number" ? diversity : undefined,
       });
+
       const log: QueryLog = {
-        id: `log-${Date.now()}`,
+        id: `log-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
         query,
         userId: key.ownerId,
         via: `agent:${key.label}`,
         latencyMs: result.latencyMs,
-        status: result.chunks.length > 0 ? "success" : "error",
-        retrievedChunks: result.chunks.map(c => ({ chunkId: c.chunkId, sourceName: c.sourceName, text: c.text, score: c.score })),
+        status: result.status,
+        retrievalId: result.retrievalId,
+        diagnostics: result.diagnostics,
+        retrievedChunks: result.chunks.map(c => ({
+          chunkId: c.chunkId,
+          citationId: c.citationId,
+          sourceName: c.sourceName,
+          text: c.text,
+          score: c.score,
+        })),
       };
       recordQueryLog(log);
       res.json(result);
     } catch (err) {
       console.error("[agent/retrieve] failed:", err);
       const reason = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `Embedding failed: ${reason}` });
+      res.status(500).json({ error: `Retrieval failed: ${reason}` });
     }
   });
 
-  // ── Agent: ingest a new memory/source (create-only) ──────────────────
+  // ── Agent: feedback on a retrieval (closes the quality loop) ─────────
+  r.post("/agent/feedback", agentAuth, async (req, res) => {
+    const { retrievalId, usedCitationIds, verdict, missingInfo } = req.body ?? {};
+
+    if (typeof retrievalId !== "string" || !retrievalId.trim()) {
+      res.status(400).json({ error: "retrievalId (string) is required" });
+      return;
+    }
+    if (typeof verdict !== "string" || !ALLOWED_VERDICTS.has(verdict)) {
+      res.status(400).json({ error: `verdict must be one of: ${[...ALLOWED_VERDICTS].join(", ")}` });
+      return;
+    }
+
+    try {
+      if (!(await retrievalExists(retrievalId))) {
+        res.status(404).json({ error: "Unknown retrievalId." });
+        return;
+      }
+      await insertFeedback({
+        id: `fb-${crypto.randomUUID()}`,
+        retrievalId,
+        verdict,
+        usedCitationIds: Array.isArray(usedCitationIds)
+          ? usedCitationIds.filter((id: unknown) => typeof id === "string").slice(0, 50)
+          : [],
+        missingInfo: typeof missingInfo === "string" ? missingInfo.slice(0, 2000) : null,
+        createdAt: new Date().toISOString(),
+      });
+      res.status(201).json({ ok: true });
+    } catch (err) {
+      console.error("[agent/feedback] failed:", err);
+      res.status(500).json({ error: "Failed to record feedback." });
+    }
+  });
+
+  // ── Agent: create OR update a source (controlled upsert) ─────────────
+  //
+  // Create:  no existing id                     → 201, version 1
+  // Update:  If-Match / expectedVersion matches → 200, version + 1
+  // No match:                                   → 409 with the current version
+  //
+  // This replaces the old "agents may never overwrite knowledge" rule, which
+  // forced append-only knowledge: a price change left both the old and the new
+  // value searchable. The optimistic-concurrency check keeps that from becoming
+  // a silent overwrite.
   r.post("/agent/sources", agentAuth, async (req, res) => {
     const key = (req as any).agentKey as AgentApiKey;
-    const { id, name, type, content } = req.body ?? {};
+    const { id, name, type, content, kind, docNo, effectiveFrom, effectiveTo, signedAt, lifecycle } = req.body ?? {};
 
     if (typeof content !== "string" || !content.trim()) {
       res.status(400).json({ error: "content (string) is required" });
@@ -163,9 +281,8 @@ export function createAgentRouter(): Router {
       return;
     }
 
-    // Optional caller-supplied id: create-only idempotency guard. If the id
-    // already exists we refuse (409) — agents may never overwrite knowledge.
-    let memoryId: string;
+    // Optional caller-supplied id: makes the write idempotent and addressable.
+    let sourceId: string;
     if (id !== undefined) {
       if (typeof id !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) {
         res.status(400).json({
@@ -173,15 +290,44 @@ export function createAgentRouter(): Router {
         });
         return;
       }
-      if (store.sources.some(s => s.id === id)) {
-        res.status(409).json({
-          error: `A source with id "${id}" already exists. Agent writes are create-only; manage existing sources in the dashboard.`,
-        });
-        return;
-      }
-      memoryId = id;
+      sourceId = id;
     } else {
-      memoryId = `mem-${crypto.randomUUID()}`;
+      sourceId = `mem-${crypto.randomUUID()}`;
+    }
+
+    let meta: {
+      kind?: string;
+      docNo?: string | null;
+      lifecycle?: string;
+      effectiveFrom?: string | null | undefined;
+      effectiveTo?: string | null | undefined;
+      signedAt?: string | null | undefined;
+    };
+    try {
+      meta = {
+        kind: kind === undefined ? undefined : String(kind).trim(),
+        docNo: docNo === undefined ? undefined : (docNo === null ? null : String(docNo).trim().slice(0, 200)),
+        lifecycle: lifecycle === undefined ? undefined : String(lifecycle).trim(),
+        effectiveFrom: parseDate(effectiveFrom, "effectiveFrom"),
+        effectiveTo: parseDate(effectiveTo, "effectiveTo"),
+        signedAt: parseDate(signedAt, "signedAt"),
+      };
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Invalid metadata." });
+      return;
+    }
+
+    if (meta.kind !== undefined && !ALLOWED_KINDS.has(meta.kind)) {
+      res.status(400).json({ error: `kind must be one of: ${[...ALLOWED_KINDS].join(", ")}` });
+      return;
+    }
+    if (meta.lifecycle !== undefined && !ALLOWED_LIFECYCLES.has(meta.lifecycle)) {
+      res.status(400).json({ error: `lifecycle must be one of: ${[...ALLOWED_LIFECYCLES].join(", ")}` });
+      return;
+    }
+    if (meta.effectiveFrom && meta.effectiveTo && meta.effectiveFrom >= meta.effectiveTo) {
+      res.status(400).json({ error: "effectiveTo must be after effectiveFrom." });
+      return;
     }
 
     const ownerName = store.users.find(u => u.id === key.ownerId)?.name ?? key.ownerId;
@@ -193,39 +339,138 @@ export function createAgentRouter(): Router {
       typeof type === "string" && type.trim() ? type.trim().slice(0, 200) : "Agent Memory";
 
     try {
+      const existing = await getSourceDetail(sourceId);
+
+      if (!existing) {
+        const result = await ingestText({
+          id: sourceId,
+          name: displayName,
+          type: sourceType,
+          content: safeContent,
+          ownerId: key.ownerId,
+          ownerName,
+          chunkSize: store.strategyConfig.chunkSize,
+          chunkOverlap: store.strategyConfig.chunkOverlap,
+          chunkOverlapUnit: store.strategyConfig.chunkOverlapUnit,
+          strategy: store.strategyConfig.separationStrategy,
+          kind: meta.kind ?? "memory",
+          docNo: meta.docNo ?? null,
+          lifecycle: meta.lifecycle ?? "effective",
+          effectiveFrom: meta.effectiveFrom ?? null,
+          effectiveTo: meta.effectiveTo ?? null,
+          signedAt: meta.signedAt ?? null,
+        });
+
+        await registerSourceWithKey(key, result.sourceId);
+        res.status(201).json({
+          sourceId: result.sourceId,
+          name: displayName,
+          versionNo: result.versionNo,
+          chunkCount: result.chunkCount,
+          status: "Synced",
+          created: true,
+          sourceFilterUpdated: key.sourceFilter.includes(result.sourceId),
+        });
+        return;
+      }
+
+      if (!keyCanSee(key, existing)) {
+        res.status(404).json({ error: "Source not found" });
+        return;
+      }
+
+      // Optimistic concurrency: never let a stale agent silently overwrite a
+      // newer version. The client can retry after reading the current state.
+      const expected = parseVersion(req.body?.expectedVersion ?? req.header("if-match"));
+      const currentVersion = existing.versionNo ?? 0;
+      if (expected === undefined) {
+        res.status(409).json({
+          error:
+            `A source with id "${sourceId}" already exists (version ${currentVersion}). ` +
+            `Send expectedVersion (or If-Match) set to ${currentVersion} to update it.`,
+          currentVersion,
+        });
+        return;
+      }
+      if (expected !== currentVersion) {
+        res.status(409).json({
+          error: `Version conflict: expected ${expected}, current is ${currentVersion}.`,
+          currentVersion,
+        });
+        return;
+      }
+
+      const metadataOnly = existing.contentSha256 !== null
+        && existing.content === safeContent;
+
+      if (metadataOnly) {
+        // Same content: update metadata/validity in place, no re-embedding.
+        await updateSourceMeta(sourceId, {
+          name: displayName,
+          type: sourceType,
+          kind: meta.kind,
+          docNo: meta.docNo,
+        });
+        await updateCurrentVersionValidity(sourceId, {
+          lifecycle: meta.lifecycle,
+          effectiveFrom: meta.effectiveFrom,
+          effectiveTo: meta.effectiveTo,
+          signedAt: meta.signedAt,
+        });
+        res.status(200).json({
+          sourceId,
+          versionNo: currentVersion,
+          chunkCount: existing.chunkCount ?? 0,
+          status: existing.status,
+          updated: true,
+          metadataOnly: true,
+        });
+        return;
+      }
+
       const result = await ingestText({
-        id: memoryId,
+        id: sourceId,
         name: displayName,
         type: sourceType,
         content: safeContent,
-        ownerId: key.ownerId,
+        ownerId: existing.ownerId,
         ownerName,
-        chunkSize: store.strategyConfig.chunkSize || 120,
-        chunkOverlap: store.strategyConfig.chunkOverlap || 15,
-        strategy: store.strategyConfig.separationStrategy || "Semantic",
+        chunkSize: store.strategyConfig.chunkSize,
+        chunkOverlap: store.strategyConfig.chunkOverlap,
+        chunkOverlapUnit: store.strategyConfig.chunkOverlapUnit,
+        strategy: store.strategyConfig.separationStrategy,
+        kind: meta.kind ?? existing.kind,
+        docNo: meta.docNo === undefined ? existing.docNo : meta.docNo,
+        lifecycle: meta.lifecycle ?? "effective",
+        effectiveFrom: meta.effectiveFrom ?? null,
+        effectiveTo: meta.effectiveTo ?? null,
+        signedAt: meta.signedAt ?? null,
+        replaceExisting: true,
       });
 
-      // Ensure the writing key can retrieve what it just stored.
-      let sourceFilterUpdated = false;
-      if (key.sourceFilter.length > 0 && !key.sourceFilter.includes(result.sourceId)) {
-        key.sourceFilter.push(result.sourceId);
-        sourceFilterUpdated = true;
-        await upsertAgentKey({ ...key, monthStamp: key._monthStamp });
-      }
-
-      res.status(201).json({
+      await registerSourceWithKey(key, result.sourceId);
+      res.status(200).json({
         sourceId: result.sourceId,
-        name: result.name,
+        name: displayName,
+        versionNo: result.versionNo,
+        previousVersion: currentVersion,
         chunkCount: result.chunkCount,
         status: "Synced",
-        sourceFilterUpdated,
+        updated: true,
       });
     } catch (err) {
       console.error("[agent/sources] failed:", err);
       const reason = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `Embedding failed: ${reason}` });
+      res.status(500).json({ error: `Ingest failed: ${reason}` });
     }
   });
+
+  /** Ensure the writing key can retrieve what it just stored. */
+  async function registerSourceWithKey(key: AgentApiKey, sourceId: string): Promise<void> {
+    if (key.sourceFilter.length === 0 || key.sourceFilter.includes(sourceId)) return;
+    key.sourceFilter.push(sourceId);
+    await upsertAgentKey({ ...key, monthStamp: key._monthStamp });
+  }
 
   return r;
 }

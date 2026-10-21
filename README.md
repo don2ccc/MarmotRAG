@@ -23,7 +23,7 @@ Callers bring their own LLM (or any downstream logic) if they want to generate a
 | **Document management** | PDF / TXT / DOCX upload (auto text extraction), plain-text paste, 50 MB limit, re-index, pause, rename, delete, chunk preview |
 | **Sharing** | Per-document private/shared toggle — shared documents are visible to every user and every API key |
 | **Chunking** | Three strategies: Semantic, Fixed, Recursive — CJK-aware via `jieba-wasm`; global config (size/overlap) |
-| **Embedding** | Local Ollama (`qwen3-embedding:4b`, 2000-dim, Matryoshka truncation) |
+| **Embedding** | Pluggable embedding backend — Ollama native or OpenAI-compatible (LM Studio / vLLM / OpenAI); any model with ≥2000 dims, truncated to 2000 |
 | **Vector Store** | PostgreSQL + `pgvector` with HNSW cosine index |
 | **Ingestion API** | `POST /api/agent/sources` stores a memory/document (create-only, idempotency guard via optional `id`) |
 | **Retrieval API** | `POST /api/agent/retrieve` returns chunks + scores (chunk retrieval only — no generation) |
@@ -84,8 +84,8 @@ MarmotRAG/
 | Node.js | ≥ 18 | Runtime |
 | PostgreSQL | ≥ 14 | Vector store host |
 | pgvector | ≥ 0.5 | `CREATE EXTENSION vector` |
-| Ollama | latest | Local embedding model |
-| `qwen3-embedding:4b` | — | 2560-dim Matryoshka embedding (truncated to 2000) |
+| Ollama (or an OpenAI-compatible embeddings server, e.g. LM Studio / vLLM) | latest | Embedding backend — see §6.1 |
+| `qwen3-embedding:4b` | — | Default 2560-dim Matryoshka embedding (truncated to 2000) |
 
 ```bash
 ollama pull qwen3-embedding:4b
@@ -125,6 +125,61 @@ First boot seeds demo users (u-1 Jane Doe, u-2 Marcus Kane, u-3 Sarah Lim), demo
 | `EMBED_API_KEY` | — | No | Bearer token, only used when `EMBED_API=openai` |
 | `PORT` | `3000` | No | HTTP port |
 | `CORS_ORIGINS` | `*` | No | Allowed origins (comma-separated) |
+
+### 6.1 Embedding backend
+
+The embedding client speaks either the **Ollama native protocol** or the **OpenAI-compatible protocol**. `EMBED_API` selects which one; `GET /api/config` always reports what is actually in use.
+
+| | `EMBED_API="ollama"` (default) | `EMBED_API="openai"` |
+|---|---|---|
+| Request | `POST {base}/api/embeddings` · `{model, prompt}` | `POST {base}/embeddings` · `{model, input}` |
+| Response field | `embedding` | `data[0].embedding` |
+| Health probe | `GET {base}/api/tags` | `GET {base}/models` |
+| Base URL example | `http://localhost:11434` | `http://localhost:1234/v1` |
+| Auth | none | optional `EMBED_API_KEY` (Bearer) |
+
+**Ollama (default)**
+
+```dotenv
+OLLAMA_BASE_URL="http://localhost:11434"
+OLLAMA_EMBED_MODEL="qwen3-embedding:4b"
+EMBED_API="ollama"
+```
+
+**LM Studio / vLLM / OpenAI-compatible** (example: `Qwen/Qwen3-Embedding-4B-GGUF`)
+
+```dotenv
+EMBED_API="openai"
+EMBED_BASE_URL="http://localhost:1234/v1"
+OLLAMA_EMBED_MODEL="Qwen/Qwen3-Embedding-4B-GGUF"
+# EMBED_API_KEY="sk-..."   # only if the server requires a bearer token
+```
+
+Notes:
+
+- For OpenAI-compatible servers the base URL must include the version prefix (`/v1`) — the client appends `/embeddings`.
+- `OLLAMA_EMBED_MODEL` must match the model id the server reports (`GET {base}/models`); LM Studio sometimes exposes a simplified id.
+- Only the **first 2000 dimensions** are stored (pgvector HNSW/ivfflat index limit), so any embedding model with ≥2000 dims works.
+- `.env` is loaded **once at startup** — restart the server after editing it. (The values themselves are read at call time, but the file is only read on boot.)
+
+Verify the configuration:
+
+```bash
+# OpenAI-compatible server: list model ids, then embed a test string
+curl http://localhost:1234/v1/models
+curl -X POST http://localhost:1234/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-Embedding-4B-GGUF","input":"test"}'
+
+# Ollama: check the model is pulled
+ollama list
+
+# App side: health probe + effective embedding settings
+curl -H "X-User-Id: u-1" http://localhost:3000/api/health   # ollamaConnected: true
+curl -H "X-User-Id: u-1" http://localhost:3000/api/config   # embeddingModel / ollamaBaseUrl / embeddingProvider
+```
+
+`POST /api/config` intentionally ignores `embeddingModel`, `ollamaBaseUrl` and `embeddingProvider` — those are environment-owned, so the dashboard can never display a value that disagrees with the running embedding client.
 
 ## 7. Dashboard Tabs
 
@@ -229,8 +284,9 @@ Response:
 |---|---|
 | `401` | Missing / invalid `X-API-Key` |
 | `403` | Key disabled, or non-owner mutation |
+| `413` | Upload too large (body exceeds the 50 MB document limit) |
 | `429` | Rate limit exceeded |
-| `500` | Embedding failed (Ollama not running / model missing) |
+| `500` | Embedding failed — the response includes the reason (endpoint unreachable, model missing, protocol mismatch, …) |
 
 ## 9. Testing
 
@@ -249,7 +305,36 @@ npm run build
 NODE_ENV=production npm start
 ```
 
-## 11. Roadmap Seams
+### 10.1 Listening address & firewall
+
+`npm start` binds **`0.0.0.0`** (all interfaces) on `PORT` (default `3000`), so it is reachable from other machines as soon as the host firewall allows it.
+
+```powershell
+# On the server — confirm the listening socket
+netstat -ano | findstr :3000          # expect  0.0.0.0:3000 ... LISTENING
+
+# From a client machine — test reachability
+Test-NetConnection -ComputerName <server-ip> -Port 3000
+
+# Allow inbound traffic (elevated PowerShell)
+New-NetFirewallRule -DisplayName "MarmotRAG 3000" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow
+```
+
+If the app runs behind IIS / nginx, forward the proxy to the same port instead of changing the bind address.
+
+## 11. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `413 {"error":"File too large. Maximum upload size is 50 MB."}` | Upload body exceeded the limit (base64 inflates the payload by ~33%) | Keep files ≤ 50 MB |
+| `Embedding failed: ... contained no vector (EMBED_API="ollama")` | Protocol mismatch — the base URL points at an OpenAI-compatible server (e.g. `.../v1`) while `EMBED_API` is still `ollama`, so the client called `/v1/api/embeddings`; the server answered HTTP 200 with an error body | Set `EMBED_API="openai"` (or point the base URL at an Ollama server) and restart — see §6.1 |
+| `model "..." not found`, or retrieval returns nothing | `OLLAMA_EMBED_MODEL` doesn't match the server's model id | Check `GET {base}/models` (OpenAI-compatible) or `ollama list` |
+| `ollamaConnected: false` although the model server is running | Wrong base URL, wrong protocol (the health probe uses `/api/tags` vs `/models`), or a firewall | Verify base URL + `EMBED_API`; see §6.1 |
+| Environment changes have no effect | `.env` is read only at startup, or the process runs from a different working directory (e.g. a service manager with a different cwd) so no `.env` was found | Restart the process; the startup log must show `injected env (N) from .env` |
+| Service unreachable from another machine | Windows Firewall blocks the port | See §10.1 |
+| Vectors disappeared after a restart | Older builds recreated `marmot_chunks` when the embedding column typmod didn't match (fixed) | Update to the current version; re-index the affected sources |
+
+## 12. Roadmap Seams
 
 - Replace `createResolveUser` with session/JWT middleware for real authentication.
 - Upgrade `is_shared` boolean to `shared_with` lists for fine-grained sharing.

@@ -9,7 +9,13 @@
     "start": "node dist/server.cjs",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "lint": "tsc --noEmit",
-    "test": "node scripts/test-retrieval.mjs"
+    "test": "node scripts/test-retrieval.mjs",
+    "test:chunking": "node scripts/test-chunking.ts",
+    "test:shadow": "tsc src/indexing.ts --outDir .tmp-build --module esnext --moduleResolution bundler --target ES2022 --skipLibCheck --noEmit false --allowImportingTsExtensions false && node scripts/verify-shadow-build.mjs",
+    "test:smoke": "node scripts/smoke-api.mjs",
+    "build:test": "tsc -p tsconfig.test.json",
+    "serve:fake-embed": "node scripts/fake-embed-server.mjs",
+    "db:check": "node scripts/probe-db.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

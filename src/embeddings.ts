@@ -75,20 +75,40 @@ export async function probeEmbeddingServer(timeoutMs = 3000): Promise<boolean> {
     return false;
   }
 }
-// pgvector ivfflat hard limit is 2000 dims; truncate the 2560-dim output here.
-const STORE_DIM = 2000;
+/**
+ * Stored vector dimension.
+ *
+ * pgvector can only build an HNSW/ivfflat index on `vector` columns up to 2000
+ * dimensions (the column itself holds up to 16000). qwen3-embedding returns
+ * 2560, so we truncate — Matryoshka representation learning keeps almost all
+ * semantic signal in the leading dimensions.
+ *
+ * Override with EMBED_STORE_DIM. Values above 2000 are accepted (the table is
+ * created accordingly) but the HNSW index is skipped, so only exact search is
+ * available until you switch to halfvec (HNSW up to 4000 dims, pgvector >= 0.7).
+ */
+export function storeDim(): number {
+  const raw = Number(process.env.EMBED_STORE_DIM ?? 2000);
+  const n = Number.isFinite(raw) ? Math.round(raw) : 2000;
+  return Math.max(1, Math.min(16000, n));
+}
 
-// qwen3-embedding:4b has a 32768 token context window.
-// Safe practical cap: 2000 chars for CJK (each char ~1.5 tokens in Qwen tokenizer),
-// giving ~3000 tokens — well within the limit.
-const MAX_CHARS = 2000;
+/** True when pgvector can index a `vector(n)` column with HNSW/ivfflat. */
+export function canIndexVector(dim: number): boolean {
+  return dim > 0 && dim <= 2000;
+}
+
+// qwen3-embedding:4b has a 32768 token context window. This cap only applies
+// to text that arrives here untruncated (queries, legacy chunks); chunking.ts
+// guarantees chunks are <= MAX_CHUNK_CHARS (2000) before they reach us.
+const MAX_CHARS = 8000;
 
 /**
  * Sanitize text before embedding:
  * 1. Collapse repeated punctuation (TOC dots "......." → ".") which causes
  *    tokenizer explosion in nomic-embed-text.
- * 2. Hard-cap by character count — CJK text tokenizes at 3-4× the char count,
- *    so we must cap chars, not words, to stay under the 2048 token limit.
+ * 2. Hard-cap by character count as a last-resort guard. Chunks are already
+ *    split to <= MAX_CHUNK_CHARS, so this should only ever fire for queries.
  */
 function sanitizeForEmbed(text: string): string {
   const cleaned = text
@@ -97,8 +117,16 @@ function sanitizeForEmbed(text: string): string {
     // Collapse whitespace runs
     .replace(/[ \t]{2,}/g, " ")
     .trim();
-  // Hard character cap — safe for both CJK and Latin text
-  return cleaned.length > MAX_CHARS ? cleaned.slice(0, MAX_CHARS) : cleaned;
+  if (cleaned.length > MAX_CHARS) {
+    // Never let this be silent: a truncated input means the stored text and the
+    // vector disagree, which later shows up as "retrieved but unanswerable".
+    console.warn(
+      `[embed] input truncated ${cleaned.length} → ${MAX_CHARS} chars; ` +
+      `raise MAX_CHUNK_CHARS or split the caller's text`
+    );
+    return cleaned.slice(0, MAX_CHARS);
+  }
+  return cleaned;
 }
 
 /**
@@ -155,8 +183,17 @@ async function embedTextOnce(text: string): Promise<number[]> {
     );
   }
 
-  // Truncate to STORE_DIM — pgvector HNSW/ivfflat cannot index > 2000 dims
-  return embedding.slice(0, STORE_DIM);
+  // Truncate to the stored dimension. pgvector can only index `vector` columns
+  // up to 2000 dims with HNSW/ivfflat, so 2560-dim models are cut here.
+  const dim = storeDim();
+  if (embedding.length > dim) return embedding.slice(0, dim);
+  if (embedding.length < dim) {
+    throw new Error(
+      `Embedding dimension ${embedding.length} is smaller than EMBED_STORE_DIM=${dim}. ` +
+      `Set EMBED_STORE_DIM to ${embedding.length} (or lower) and restart.`
+    );
+  }
+  return embedding;
 }
 
 /**
