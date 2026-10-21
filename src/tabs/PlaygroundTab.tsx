@@ -57,7 +57,7 @@ export default function PlaygroundTab({ userId, showToast }: Props) {
           <input
             value={query}
             onChange={e => setQuery(e.target.value)}
-            placeholder="e.g. 2024年国巨集团的毛利率是多少？"
+            placeholder="e.g. 2024年示例集团的毛利率是多少？"
             className="w-full pl-10 pr-4 py-3 bg-[#0E1218] border border-white/10 rounded-lg text-sm text-white placeholder-white/40 focus:outline-none focus:ring-1 focus:ring-[#86C9A4] font-sans"
           />
         </div>

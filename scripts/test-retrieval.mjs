@@ -73,7 +73,7 @@ ok("u-1 sees shared/own docs", (srcA.body.sources ?? []).length > 0, `got ${srcA
 
 // ── 3. u-1 creates a private document ─────────────────────────────────
 console.log("\n3. Create document as u-1 (private)");
-const content = "Marmot RAG 检索服务测试文档。国巨集团 2024 财年毛利率达到 38.5%，创历史新高。该指标反映了产品组合优化与成本控制成效。";
+const content = "Marmot RAG 检索服务测试文档。示例集团 2024 财年毛利率达到 38.5%，创历史新高。该指标反映了产品组合优化与成本控制成效。";
 const created = await req("/api/sources", {
   method: "POST",
   userId: USER_A,
@@ -114,7 +114,7 @@ if (docId) {
   ok("u-1 shares doc", share.status === 200 && share.body.isShared === true);
   const listB2 = await req("/api/sources", { userId: USER_B });
   ok("u-2 now sees shared doc", (listB2.body.sources ?? []).some(s => s.id === docId));
-  const retrB = await req("/api/retrieve", { method: "POST", userId: USER_B, body: { query: "国巨集团毛利率" } });
+  const retrB = await req("/api/retrieve", { method: "POST", userId: USER_B, body: { query: "示例集团毛利率" } });
   ok("u-2 retrieve hits shared doc", (retrB.body.chunks ?? []).some(c => c.sourceId === docId));
   const unshare = await req(`/api/sources/${docId}`, { method: "PATCH", userId: USER_A, body: { isShared: false } });
   ok("u-1 unshares doc", unshare.status === 200 && unshare.body.isShared === false);
@@ -180,7 +180,7 @@ if (keyA) {
 }
 
 if (docId && keyB) {
-  const retrKeyB = await req("/api/agent/retrieve", { method: "POST", apiKey: keyB, body: { query: "国巨集团毛利率" } });
+  const retrKeyB = await req("/api/agent/retrieve", { method: "POST", apiKey: keyB, body: { query: "示例集团毛利率" } });
   ok("u-2's key cannot see u-1 private doc", (retrKeyB.body.chunks ?? []).every(c => c.sourceId !== docId));
 }
 

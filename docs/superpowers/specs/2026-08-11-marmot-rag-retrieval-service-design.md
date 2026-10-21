@@ -77,7 +77,7 @@ DROP TABLE IF EXISTS marmot_pipelines;
 - `SEED_AGENT_KEYS` 改为带 `owner_id: 'u-1'`、去掉 `pipelineId`
 - `SEED_QUERY_LOGS` 改为新 `QueryLog` 形状（query/userId/via/latencyMs/retrievedChunks）
 
-**存量数据现状**（实施时已知）：现有 2 个 source 均为 Paused 且 chunk 表为空（历史维度迁移所致）；迁移后归属 u-1。验证阶段新建一个小文档实测，不依赖旧数据；如需要，可对 YAGEO 文档触发一次 reindex。
+**存量数据现状**（实施时已知）：现有 2 个 source 均为 Paused 且 chunk 表为空（历史维度迁移所致）；迁移后归属 u-1。验证阶段新建一个小文档实测，不依赖旧数据；如需要，可对示例文档触发一次 reindex。
 
 ## 5. 身份与权限（演示模式）
 
@@ -162,15 +162,15 @@ LIMIT $k
 
 ```jsonc
 // 请求
-{ "query": "2024年国巨集团的毛利率是多少？", "topK": 5, "minScore": 0.3, "sourceFilter": ["src-..."] }
+{ "query": "2024年示例集团的毛利率是多少？", "topK": 5, "minScore": 0.3, "sourceFilter": ["src-..."] }
 // 响应
 {
   "query": "...",
   "chunks": [
-    { "chunkId": "src-...-chk-0", "sourceId": "src-...", "sourceName": "YAGEO_ESG2024_tw",
+    { "chunkId": "src-...-chk-0", "sourceId": "src-...", "sourceName": "EXAMPLE_ESG2024_tw",
       "text": "...", "score": 0.82, "tokenCount": 128 }
   ],
-  "context": "[Document 1: YAGEO_ESG2024_tw]\ntext...",
+  "context": "[Document 1: EXAMPLE_ESG2024_tw]\ntext...",
   "latencyMs": 245
 }
 ```

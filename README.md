@@ -253,7 +253,7 @@ Ingest rules:
 curl -X POST http://localhost:3000/api/agent/retrieve \
   -H "X-API-Key: mrmk_..." \
   -H "Content-Type: application/json" \
-  -d '{"query":"2024年国巨集团的毛利率是多少？","topK":5,"minScore":0.3}'
+  -d '{"query":"2024年示例集团的毛利率是多少？","topK":5,"minScore":0.3}'
 ```
 
 Response:
@@ -265,13 +265,13 @@ Response:
     {
       "chunkId": "src-...-chk-0",
       "sourceId": "src-...",
-      "sourceName": "YAGEO_ESG2024_tw",
+      "sourceName": "EXAMPLE_ESG2024_tw",
       "text": "...",
       "score": 0.82,
       "tokenCount": 128
     }
   ],
-  "context": "[Document 1: YAGEO_ESG2024_tw]\n...",
+  "context": "[Document 1: EXAMPLE_ESG2024_tw]\n...",
   "latencyMs": 245
 }
 ```

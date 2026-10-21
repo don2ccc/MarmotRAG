@@ -15,7 +15,7 @@
  */
 const BASE = process.argv[2] ?? "http://127.0.0.1:3999";
 const USER = "u-1";
-const DOC_NO = "国巨人〔2024〕12号";
+const DOC_NO = "示例发〔2024〕12号";
 
 let passed = 0;
 let failed = 0;

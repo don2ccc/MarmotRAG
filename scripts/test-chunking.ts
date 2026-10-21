@@ -46,7 +46,7 @@ function describeGaps(text: string, gaps: number[]): string {
 }
 
 const CN = [
-  "国巨集团2024年第三季度毛利率达到38.5%，创历史新高。",
+  "示例集团2024年第三季度毛利率达到38.5%，创历史新高。",
   "公司在被动元件领域保持领先地位，产品覆盖电阻、电容与电感。",
   "第二段：员工考勤制度规定，年休假天数随工龄增长。",
   "合同约定：任何一方违约，应向守约方支付合同总额百分之十的违约金。",
@@ -96,7 +96,7 @@ ok("English text is fully covered", uncovered(english, fixed).length === 0);
 
 // ── 6. Token counting is CJK-aware and consistent ─────────────────────
 console.log("\n6. Token counting");
-const cjk500 = "国巨集团是一家被动元件制造商，主要产品包括电阻、电容和电感。".repeat(20);
+const cjk500 = "示例集团是一家被动元件制造商，主要产品包括电阻、电容和电感。".repeat(20);
 const tokens = countTokens(cjk500);
 ok("CJK token count is in a sane range", tokens > cjk500.length * 0.2 && tokens < cjk500.length, `${tokens} tokens for ${cjk500.length} chars`);
 const tokenPieces = chunkWithPolicy(cjk500, { chunkSize: 100, chunkOverlapPercent: 0, strategy: "Fixed" });

@@ -284,7 +284,7 @@ export default function ApiAccessTab({ userId, sources, showToast, showConfirm }
 {`POST /api/agent/retrieve
 X-API-Key: mrmk_...
 {
-  "query": "2024年国巨集团的毛利率是多少？",
+  "query": "2024年示例集团的毛利率是多少？",
   "topK": 5,
   "minScore": 0.3,
   "sourceFilter": []            // optional
@@ -300,13 +300,13 @@ X-API-Key: mrmk_...
     {
       "chunkId": "src-...-chk-0",
       "sourceId": "src-...",
-      "sourceName": "YAGEO_ESG2024_tw",
+      "sourceName": "EXAMPLE_ESG2024_tw",
       "text": "...",
       "score": 0.82,
       "tokenCount": 128
     }
   ],
-  "context": "[Document 1: YAGEO_ESG2024_tw]\\n...",
+  "context": "[Document 1: EXAMPLE_ESG2024_tw]\\n...",
   "latencyMs": 245
 }`}
             </pre>
