@@ -19,6 +19,11 @@ export interface SourceDoc {
   isShared: boolean;
   content: string;
   chunks: Chunk[];
+  /** Collection the document belongs to (one per document). */
+  collectionId?: string | null;
+  collectionName?: string | null;
+  tags?: string[];
+  meta?: Record<string, unknown>;
   /** policy | process | contract | template | annex | memory | document */
   kind?: string;
   docNo?: string | null;
@@ -72,13 +77,53 @@ export interface StrategyConfig {
 export type TabType = "workspace" | "knowledge-base" | "admin" | "dashboard" | "playground" | "api-access";
 
 /**
+ * What an API key is allowed to read.
+ *
+ * Dimensions are ANDed with "empty = no restriction"; when every dimension is
+ * empty and `all` is false the key can read nothing (deny by default).
+ */
+export interface KeyScope {
+  all: boolean;
+  collections: string[];
+  kinds: string[];
+  tags: string[];
+  docIds: string[];
+  /** Include versions whose lifecycle is `draft`. */
+  allowDraft: boolean;
+  /** Include documents past `effective_to`. */
+  allowExpired: boolean;
+  /** Allow `asOf` historical retrieval. */
+  allowAsOf: boolean;
+}
+
+export const EMPTY_SCOPE: KeyScope = {
+  all: false,
+  collections: [],
+  kinds: [],
+  tags: [],
+  docIds: [],
+  allowDraft: false,
+  allowExpired: false,
+  allowAsOf: false,
+};
+
+export interface Collection {
+  id: string;
+  name: string;
+  description: string;
+  defaultKind: string;
+  documentCount: number;
+  createdAt: string;
+}
+
+/**
  * Safe public representation of an Agent API Key — no secret, no internal fields.
  */
 export interface AgentApiKeyPublic {
   id: string;
   label: string;
   keyPreview: string;
-  sourceFilter: string[];    // [] = all visible sources, otherwise restrict retrieval
+  scope: KeyScope;
   rateLimit: number;         // max requests per minute (0 = unlimited)
   enabled: boolean;
   createdAt: string;

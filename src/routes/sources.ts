@@ -4,13 +4,14 @@ import {
   upsertSource, deleteSource, deleteChunksBySource, loadChunksBySource,
   renameChunksSourceName, isVersionBuilding, loadVersionStates,
   updateSourceMeta, updateCurrentVersionValidity, getSourceDetail,
+  listCollections, createCollection, updateCollection, deleteCollection,
+  setSourceCollection, listVersions,
   type PersistedUser,
 } from "../db.js";
 import { retrieveCore } from "../retrieval.js";
 import { indexSource, planChunks, policyFromConfig, rebuildMissingVersions } from "../indexing.js";
 import { store, recordQueryLog } from "../store.js";
-import { denyIfNotOwner } from "../auth.js";
-import type { QueryLog, SourceDoc } from "../types";
+import type { KeyScope, QueryLog, SourceDoc } from "../types";
 
 const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = requireCjs("pdf-parse");
 const mammoth = requireCjs("mammoth") as {
@@ -59,10 +60,12 @@ function parseDate(value: unknown, field: string): string | null | undefined {
   return date.toISOString();
 }
 
-/** Sources the given user may see: own + shared. */
-export function visibleSources(userId: string): SourceDoc[] {
-  return store.sources.filter(s => s.ownerId === userId || s.isShared);
+/** The console is admin-only, so every document is visible to the operator. */
+export function visibleSources(_userId?: string): SourceDoc[] {
+  return store.sources;
 }
+
+const ALLOWED_COLLECTION_KINDS = new Set(["policy", "process", "contract", "template", "annex", "memory", "document"]);
 
 export function createSourcesRouter(): Router {
   const r = Router();
@@ -122,11 +125,11 @@ export function createSourcesRouter(): Router {
     const user = currentUser(req);
     const doc = store.sources.find(d => d.id === req.params.id);
     if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
-    if (denyIfNotOwner(doc.ownerId, req as any, res)) return;
 
     const {
       name, type, status, isShared, kind, docNo,
       lifecycle, effectiveFrom, effectiveTo, signedAt,
+      collectionId, tags,
     } = req.body ?? {};
 
     let dates: {
@@ -172,6 +175,17 @@ export function createSourcesRouter(): Router {
     // version currently being served.
     await updateSourceMeta(doc.id, { kind: doc.kind, docNo: doc.docNo });
     await updateCurrentVersionValidity(doc.id, { lifecycle, ...dates });
+    if (collectionId !== undefined || tags !== undefined) {
+      const nextCollection = collectionId === undefined
+        ? undefined
+        : (collectionId === null || collectionId === "" ? null : String(collectionId));
+      const nextTags = Array.isArray(tags)
+        ? tags.filter((t: unknown): t is string => typeof t === "string").slice(0, 30)
+        : undefined;
+      await setSourceCollection(doc.id, nextCollection, nextTags);
+      if (nextCollection !== undefined) doc.collectionId = nextCollection;
+      if (nextTags !== undefined) doc.tags = nextTags;
+    }
     // source_name is denormalized onto chunks; keep search results in sync.
     await renameChunksSourceName(doc.id, doc.name);
 
@@ -210,12 +224,91 @@ export function createSourcesRouter(): Router {
     });
   });
 
+  // ── Collections: permission + policy unit ────────────────────────────
+  r.get("/collections", async (_req, res) => {
+    try {
+      res.json({ collections: await listCollections() });
+    } catch (err) {
+      console.error("[collections] list failed:", err);
+      res.status(500).json({ error: "Failed to load collections." });
+    }
+  });
+
+  r.post("/collections", async (req, res) => {
+    const { name, description, defaultKind } = req.body ?? {};
+    const safeName = typeof name === "string" ? name.trim().slice(0, 120) : "";
+    if (!safeName) { res.status(400).json({ error: "name is required" }); return; }
+    if (defaultKind !== undefined && !ALLOWED_COLLECTION_KINDS.has(String(defaultKind))) {
+      res.status(400).json({ error: `defaultKind must be one of: ${[...ALLOWED_COLLECTION_KINDS].join(", ")}` });
+      return;
+    }
+    try {
+      const collection = await createCollection({
+        name: safeName,
+        description: typeof description === "string" ? description.slice(0, 500) : "",
+        defaultKind: defaultKind === undefined ? undefined : String(defaultKind),
+      });
+      res.status(201).json(collection);
+    } catch (err) {
+      if ((err as { code?: string }).code === "23505") {
+        res.status(409).json({ error: "A collection with that name already exists." });
+        return;
+      }
+      console.error("[collections] create failed:", err);
+      res.status(500).json({ error: "Failed to create the collection." });
+    }
+  });
+
+  r.patch("/collections/:id", async (req, res) => {
+    const { name, description, defaultKind } = req.body ?? {};
+    if (name !== undefined && !String(name).trim()) {
+      res.status(400).json({ error: "name cannot be empty" });
+      return;
+    }
+    try {
+      await updateCollection(req.params.id, {
+        name: name === undefined ? undefined : String(name).trim().slice(0, 120),
+        description: description === undefined ? undefined : String(description).slice(0, 500),
+        defaultKind: defaultKind === undefined ? undefined : String(defaultKind),
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      if ((err as { code?: string }).code === "23505") {
+        res.status(409).json({ error: "A collection with that name already exists." });
+        return;
+      }
+      console.error("[collections] update failed:", err);
+      res.status(500).json({ error: "Failed to update the collection." });
+    }
+  });
+
+  r.delete("/collections/:id", async (req, res) => {
+    try {
+      await deleteCollection(req.params.id);
+      res.json({ message: "Collection removed; its documents are now unfiled." });
+    } catch (err) {
+      console.error("[collections] delete failed:", err);
+      res.status(500).json({ error: "Failed to delete the collection." });
+    }
+  });
+
+  // Version history for the detail drawer.
+  r.get("/sources/:id/versions", async (req, res) => {
+    const doc = store.sources.find(d => d.id === req.params.id);
+    if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
+    try {
+      res.json({ sourceId: doc.id, versions: await listVersions(doc.id) });
+    } catch (err) {
+      console.error("[sources/versions] failed:", err);
+      res.status(500).json({ error: "Failed to load versions." });
+    }
+  });
+
   // Delete a source and its chunks — owner only.
   r.delete("/sources/:id", async (req, res) => {
     const user = currentUser(req);
     const doc = store.sources.find(d => d.id === req.params.id);
     if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
-    if (denyIfNotOwner(doc.ownerId, req as any, res)) return;
     store.sources = store.sources.filter(d => d.id !== req.params.id);
     try {
       await deleteChunksBySource(req.params.id);
@@ -311,7 +404,6 @@ export function createSourcesRouter(): Router {
     const user = currentUser(req);
     const doc = store.sources.find(d => d.id === req.params.id);
     if (!doc) { res.status(404).json({ error: "Source not found" }); return; }
-    if (denyIfNotOwner(doc.ownerId, req as any, res)) return;
 
     if (await isVersionBuilding(doc.id)) {
       res.status(409).json({ error: "A re-index is already running for this document." });
@@ -422,7 +514,7 @@ export function createSourcesRouter(): Router {
   r.post("/retrieve", async (req, res) => {
     const user = currentUser(req);
     const {
-      query, topK, minScore, sourceFilter, kinds, docIds, asOf, includeExpired, mode, diversity,
+      query, topK, minScore, collections, kinds, tags, docIds, asOf, includeExpired, mode, diversity,
     } = req.body ?? {};
     if (!query || typeof query !== "string" || !query.trim()) {
       res.status(400).json({ error: "Query is required" });
@@ -432,15 +524,19 @@ export function createSourcesRouter(): Router {
       res.status(400).json({ error: "Query exceeds maximum length of 10,000 characters." });
       return;
     }
+    const strings = (value: unknown): string[] | undefined =>
+      Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : undefined;
     try {
       const result = await retrieveCore({
         query,
-        userId: user.id,
         topK: typeof topK === "number" ? topK : undefined,
         minScore: typeof minScore === "number" ? minScore : undefined,
-        sourceFilter: Array.isArray(sourceFilter) ? sourceFilter : undefined,
-        kinds: Array.isArray(kinds) ? kinds.filter((k: unknown) => typeof k === "string") : undefined,
-        docIds: Array.isArray(docIds) ? docIds.filter((d: unknown) => typeof d === "string") : undefined,
+        // The console operator sees everything; scope only applies to API keys.
+        scope: undefined,
+        collections: strings(collections),
+        kinds: strings(kinds),
+        tags: strings(tags),
+        docIds: strings(docIds),
         asOf: typeof asOf === "string" ? asOf : null,
         includeExpired: includeExpired === true,
         mode: (["fast", "balanced", "deep"] as const).includes(mode) ? mode : undefined,

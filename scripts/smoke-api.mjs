@@ -16,6 +16,24 @@
 const BASE = process.argv[2] ?? "http://127.0.0.1:3999";
 const USER = "u-1";
 const DOC_NO = "示例发〔2024〕12号";
+let ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim();
+
+async function login() {
+  if (ADMIN_TOKEN) return;
+  const email = process.env.ADMIN_EMAIL ?? "";
+  const password = process.env.ADMIN_PASSWORD ?? "";
+  if (!email || !password) throw new Error("Set ADMIN_EMAIL and ADMIN_PASSWORD (or ADMIN_TOKEN) to run this script.");
+  const res = await fetch(`${BASE}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error(`login failed: ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  ADMIN_TOKEN = data.token;
+}
+
+await login();
 
 let passed = 0;
 let failed = 0;
@@ -34,6 +52,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function req(path, { method = "GET", body, userId, apiKey } = {}) {
   const headers = {};
+  if (ADMIN_TOKEN) headers["Authorization"] = `Bearer ${ADMIN_TOKEN}`;
   if (userId) headers["X-User-Id"] = userId;
   if (apiKey) headers["X-API-Key"] = apiKey;
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -50,11 +69,9 @@ async function req(path, { method = "GET", body, userId, apiKey } = {}) {
 
 /** POST an SSE endpoint and collect its events. */
 async function sse(path, body, userId) {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-User-Id": userId },
-    body: JSON.stringify(body),
-  });
+  const headers = { "Content-Type": "application/json", "X-User-Id": userId };
+  if (ADMIN_TOKEN) headers["Authorization"] = `Bearer ${ADMIN_TOKEN}`;
+  const res = await fetch(`${BASE}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(`${path} → ${res.status} ${await res.text()}`);
   const text = await res.text();
   return [...text.matchAll(/^event: (\w+)\ndata: (.+)$/gm)].map(m => ({

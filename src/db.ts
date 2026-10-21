@@ -1,6 +1,7 @@
 import pg from "pg";
 import pgvector from "pgvector/pg";
 import { createHash, randomUUID } from "node:crypto";
+import { EMPTY_SCOPE, type KeyScope } from "./types.js";
 import { storeDim, canIndexVector } from "./embeddings.js";
 
 const { Pool } = pg;
@@ -179,7 +180,24 @@ export async function initDb(): Promise<void> {
   await pool.query(`ALTER TABLE marmot_sources ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'document'`);
   await pool.query(`ALTER TABLE marmot_sources ADD COLUMN IF NOT EXISTS doc_no TEXT`);
   await pool.query(`ALTER TABLE marmot_sources ADD COLUMN IF NOT EXISTS current_version_id TEXT`);
+  await pool.query(`ALTER TABLE marmot_sources ADD COLUMN IF NOT EXISTS collection_id TEXT`);
+  await pool.query(`ALTER TABLE marmot_sources ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}'`);
+  await pool.query(`ALTER TABLE marmot_sources ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS marmot_sources_collection_idx ON marmot_sources (collection_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS marmot_sources_tags_idx ON marmot_sources USING gin (tags)`);
   await pool.query(`UPDATE marmot_sources SET owner_id = 'u-1' WHERE owner_id = ''`);
+
+  // ── Collections (permission + policy unit) ───────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS marmot_collections (
+      id           TEXT PRIMARY KEY,
+      name         TEXT NOT NULL UNIQUE,
+      description  TEXT NOT NULL DEFAULT '',
+      default_kind TEXT NOT NULL DEFAULT 'document',
+      sort_order   INTEGER NOT NULL DEFAULT 0,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
 
   // ── Versions ─────────────────────────────────────────────────────────
   // One row per complete index snapshot. `current_version_id` on the document is
@@ -326,7 +344,7 @@ export async function initDb(): Promise<void> {
       key               TEXT NOT NULL UNIQUE,
       key_preview       TEXT NOT NULL,
       owner_id          TEXT NOT NULL DEFAULT '',
-      source_filter     TEXT NOT NULL DEFAULT '[]',
+      scope             TEXT NOT NULL DEFAULT '{}',
       rate_limit        INTEGER NOT NULL DEFAULT 60,
       enabled           BOOLEAN NOT NULL DEFAULT TRUE,
       created_at        TEXT NOT NULL DEFAULT '',
@@ -337,6 +355,8 @@ export async function initDb(): Promise<void> {
     )
   `);
   await pool.query(`ALTER TABLE marmot_agent_keys ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE marmot_agent_keys ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT '{}'`);
+  await pool.query(`ALTER TABLE marmot_agent_keys DROP COLUMN IF EXISTS source_filter`);
   await pool.query(`UPDATE marmot_agent_keys SET owner_id = 'u-1' WHERE owner_id = ''`);
   await pool.query(`ALTER TABLE marmot_agent_keys DROP COLUMN IF EXISTS pipeline_id`);
 
@@ -396,6 +416,8 @@ export async function initDb(): Promise<void> {
       last_login TEXT NOT NULL DEFAULT ''
     )
   `);
+  await pool.query(`ALTER TABLE marmot_users ADD COLUMN IF NOT EXISTS password_hash TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE marmot_users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0`);
   console.log("[db] All marmot_* tables ready");
 }
 
@@ -501,14 +523,17 @@ export interface CandidateRow {
 }
 
 export interface SearchFilter {
-  userId: string;
-  sourceFilter?: string[];
-  excludeSourceIds?: string[];
+  /** Unrestricted (dashboard admin). When false, the scope dimensions apply. */
+  scopeAll?: boolean;
+  collections?: string[];
   kinds?: string[];
+  tags?: string[];
   docIds?: string[];
+  excludeDocIds?: string[];
   /** ISO timestamp: retrieve the version that was effective at that moment. */
   asOf?: string | null;
   includeExpired?: boolean;
+  includeDraft?: boolean;
 }
 
 const CANDIDATE_COLUMNS = `
@@ -551,7 +576,13 @@ function mapCandidate(row: Record<string, any>, match: "vector" | "lexical"): Ca
   };
 }
 
-/** Build the shared visibility / version / time predicates. */
+/**
+ * Build the shared scope / version / time predicates.
+ *
+ * Scope dimensions are ANDed with "empty = no restriction". When every
+ * dimension is empty and `scopeAll` is false the result is `FALSE`: a key with
+ * no scope can read nothing (deny by default).
+ */
 function buildFilter(filter: SearchFilter, params: unknown[]): string[] {
   const add = (value: unknown): string => {
     params.push(value);
@@ -560,8 +591,7 @@ function buildFilter(filter: SearchFilter, params: unknown[]): string[] {
 
   const clauses: string[] = [
     `s.status = 'Synced'`,
-    `(s.owner_id = ${add(filter.userId)} OR s.is_shared = TRUE)`,
-    `v.lifecycle = 'effective'`,
+    filter.includeDraft ? `v.lifecycle IN ('effective', 'draft')` : `v.lifecycle = 'effective'`,
   ];
 
   if (filter.asOf) {
@@ -577,17 +607,30 @@ function buildFilter(filter: SearchFilter, params: unknown[]): string[] {
     }
   }
 
-  if (filter.sourceFilter?.length) {
-    clauses.push(`c.source_id = ANY(${add(filter.sourceFilter)}::text[])`);
-  }
-  if (filter.excludeSourceIds?.length) {
-    clauses.push(`c.source_id <> ALL(${add(filter.excludeSourceIds)}::text[])`);
+  // Scope and request filters compile to the same AND-ed dimensions; the only
+  // difference is that an unrestricted (admin) query with no dimensions is not
+  // denied, while a scoped key with no dimensions is.
+  const scope: string[] = [];
+  if (filter.collections?.length) {
+    scope.push(`s.collection_id = ANY(${add(filter.collections)}::text[])`);
   }
   if (filter.kinds?.length) {
-    clauses.push(`s.kind = ANY(${add(filter.kinds)}::text[])`);
+    scope.push(`s.kind = ANY(${add(filter.kinds)}::text[])`);
+  }
+  if (filter.tags?.length) {
+    scope.push(`s.tags && ${add(filter.tags)}::text[]`);
   }
   if (filter.docIds?.length) {
-    clauses.push(`s.id = ANY(${add(filter.docIds)}::text[])`);
+    scope.push(`s.id = ANY(${add(filter.docIds)}::text[])`);
+  }
+  if (scope.length > 0) {
+    clauses.push(`(${scope.join(" AND ")})`);
+  } else if (!filter.scopeAll) {
+    clauses.push("FALSE");
+  }
+
+  if (filter.excludeDocIds?.length) {
+    clauses.push(`s.id <> ALL(${add(filter.excludeDocIds)}::text[])`);
   }
   return clauses;
 }
@@ -701,12 +744,12 @@ export async function searchLexical(
 export async function searchChunks(
   queryEmbedding: number[],
   topK: number,
-  opts: { userId: string; sourceFilter?: string[]; excludeSourceIds?: string[] }
+  opts: { userId?: string; sourceFilter?: string[]; excludeSourceIds?: string[] } = {}
 ): Promise<{ id: string; sourceId: string; sourceName: string; text: string; tokensCount: number; score: number }[]> {
   const rows = await searchVector(queryEmbedding, topK, {
-    userId: opts.userId,
-    sourceFilter: opts.sourceFilter,
-    excludeSourceIds: opts.excludeSourceIds,
+    scopeAll: !opts.sourceFilter || opts.sourceFilter.length === 0,
+    docIds: opts.sourceFilter,
+    excludeDocIds: opts.excludeSourceIds,
   });
   return rows.map(row => ({
     id: row.id,
@@ -934,6 +977,9 @@ export interface DocVersionState {
   contentLength: number;
   kind: string;
   docNo: string | null;
+  collectionId: string | null;
+  collectionName: string | null;
+  tags: string[];
   lifecycle: string | null;
   effectiveFrom: string | null;
   effectiveTo: string | null;
@@ -945,7 +991,8 @@ export interface DocVersionState {
 export async function loadVersionStates(): Promise<DocVersionState[]> {
   const { rows } = await getPool().query(
     `SELECT s.id, s.name, s.status, s.current_version_id, s.vectors_count,
-            s.kind, s.doc_no, length(s.content) AS content_length,
+            s.kind, s.doc_no, s.collection_id, s.tags, c.name AS collection_name,
+            length(s.content) AS content_length,
             v.version_no, v.lifecycle, v.effective_from, v.effective_to,
             (SELECT count(*)::int FROM marmot_doc_versions dv WHERE dv.doc_id = s.id) AS version_count,
             (SELECT dv.last_error
@@ -954,6 +1001,7 @@ export async function loadVersionStates(): Promise<DocVersionState[]> {
               ORDER BY dv.created_at DESC
               LIMIT 1) AS last_error
        FROM marmot_sources s
+       LEFT JOIN marmot_collections c ON c.id = s.collection_id
        LEFT JOIN marmot_doc_versions v ON v.id = s.current_version_id
       ORDER BY s.id`
   );
@@ -968,6 +1016,9 @@ export async function loadVersionStates(): Promise<DocVersionState[]> {
     contentLength: Number(r.content_length ?? 0),
     kind: (r.kind as string | null) ?? "document",
     docNo: (r.doc_no as string | null) ?? null,
+    collectionId: (r.collection_id as string | null) ?? null,
+    collectionName: (r.collection_name as string | null) ?? null,
+    tags: (r.tags as string[] | null) ?? [],
     lifecycle: (r.lifecycle as string | null) ?? null,
     effectiveFrom: toIso(r.effective_from),
     effectiveTo: toIso(r.effective_to),
@@ -1036,6 +1087,118 @@ export async function renameChunksSourceName(sourceId: string, name: string): Pr
   );
 }
 
+// ── Collections (permission + policy unit) ────────────────────────────
+
+export interface CollectionRow {
+  id: string;
+  name: string;
+  description: string;
+  defaultKind: string;
+  documentCount: number;
+  createdAt: string;
+}
+
+export async function listCollections(): Promise<CollectionRow[]> {
+  const { rows } = await getPool().query(
+    `SELECT c.id, c.name, c.description, c.default_kind, c.created_at,
+            (SELECT count(*)::int FROM marmot_sources s WHERE s.collection_id = c.id) AS document_count
+       FROM marmot_collections c
+      ORDER BY c.sort_order, c.name`
+  );
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    defaultKind: r.default_kind,
+    documentCount: Number(r.document_count ?? 0),
+    createdAt: new Date(r.created_at).toISOString(),
+  }));
+}
+
+export async function createCollection(input: {
+  name: string;
+  description?: string;
+  defaultKind?: string;
+}): Promise<CollectionRow> {
+  const id = `col-${randomUUID()}`;
+  await getPool().query(
+    `INSERT INTO marmot_collections (id, name, description, default_kind)
+     VALUES ($1, $2, $3, $4)`,
+    [id, input.name, input.description ?? "", input.defaultKind ?? "document"]
+  );
+  const all = await listCollections();
+  return all.find(c => c.id === id) as CollectionRow;
+}
+
+export async function updateCollection(
+  id: string,
+  input: { name?: string; description?: string; defaultKind?: string }
+): Promise<void> {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  const set = (column: string, value: unknown): void => {
+    params.push(value);
+    sets.push(`${column} = $${params.length}`);
+  };
+  if (input.name !== undefined) set("name", input.name);
+  if (input.description !== undefined) set("description", input.description);
+  if (input.defaultKind !== undefined) set("default_kind", input.defaultKind);
+  if (sets.length === 0) return;
+  params.push(id);
+  await getPool().query(
+    `UPDATE marmot_collections SET ${sets.join(", ")} WHERE id = $${params.length}`,
+    params
+  );
+}
+
+/** Deleting a collection un-files its documents; it never deletes documents. */
+export async function deleteCollection(id: string): Promise<void> {
+  const pool = getPool();
+  await pool.query("UPDATE marmot_sources SET collection_id = NULL WHERE collection_id = $1", [id]);
+  await pool.query("DELETE FROM marmot_collections WHERE id = $1", [id]);
+}
+
+export async function setSourceCollection(
+  docId: string,
+  collectionId?: string | null,
+  tags?: string[]
+): Promise<void> {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  if (collectionId !== undefined) {
+    params.push(collectionId);
+    sets.push(`collection_id = $${params.length}`);
+  }
+  if (tags !== undefined) {
+    params.push(tags);
+    sets.push(`tags = $${params.length}::text[]`);
+  }
+  if (sets.length === 0) return;
+  params.push(docId);
+  await getPool().query(
+    `UPDATE marmot_sources SET ${sets.join(", ")} WHERE id = $${params.length}`,
+    params
+  );
+}
+
+/** Map of document id → {collectionId, collectionName, tags}. */
+export async function loadDocumentFiling(): Promise<Map<string, {
+  collectionId: string | null;
+  collectionName: string | null;
+  tags: string[];
+}>> {
+  const { rows } = await getPool().query(
+    `SELECT s.id, s.collection_id, s.tags, c.name AS collection_name
+       FROM marmot_sources s
+       LEFT JOIN marmot_collections c ON c.id = s.collection_id`
+  );
+  return new Map(rows.map(r => [r.id as string, {
+    collectionId: (r.collection_id as string | null) ?? null,
+    collectionName: (r.collection_name as string | null) ?? null,
+    tags: (r.tags as string[] | null) ?? [],
+  }]));
+}
+
 // ── Document metadata & agent read/update support ─────────────────────
 
 export interface SourceDetail {
@@ -1044,6 +1207,8 @@ export interface SourceDetail {
   type: string;
   kind: string;
   docNo: string | null;
+  collectionId: string | null;
+  tags: string[];
   status: string;
   ownerId: string;
   isShared: boolean;
@@ -1064,7 +1229,7 @@ export interface SourceDetail {
 export async function getSourceDetail(docId: string): Promise<SourceDetail | null> {
   const { rows } = await getPool().query(
     `SELECT s.id, s.name, s.type, s.kind, s.doc_no, s.status, s.owner_id, s.is_shared,
-            s.content, s.current_version_id, s.last_sync, s.vectors_count,
+            s.collection_id, s.tags, s.content, s.current_version_id, s.last_sync, s.vectors_count,
             v.version_no, v.content_sha256, v.chunk_count, v.lifecycle,
             v.effective_from, v.effective_to, v.signed_at
        FROM marmot_sources s
@@ -1080,6 +1245,8 @@ export async function getSourceDetail(docId: string): Promise<SourceDetail | nul
     type: r.type,
     kind: r.kind ?? "document",
     docNo: r.doc_no ?? null,
+    collectionId: r.collection_id ?? null,
+    tags: (r.tags as string[] | null) ?? [],
     status: r.status,
     ownerId: r.owner_id,
     isShared: r.is_shared,
@@ -1357,7 +1524,7 @@ export interface PersistedAgentKey {
   key: string;
   keyPreview: string;
   ownerId: string;
-  sourceFilter: string[];
+  scope: KeyScope;
   rateLimit: number;
   enabled: boolean;
   createdAt: string;
@@ -1367,9 +1534,27 @@ export interface PersistedAgentKey {
   monthStamp: string;
 }
 
+function parseScope(raw: unknown): KeyScope {
+  try {
+    const parsed = JSON.parse(String(raw ?? "{}")) as Partial<KeyScope>;
+    return {
+      all: parsed.all === true,
+      collections: Array.isArray(parsed.collections) ? parsed.collections : [],
+      kinds: Array.isArray(parsed.kinds) ? parsed.kinds : [],
+      tags: Array.isArray(parsed.tags) ? parsed.tags : [],
+      docIds: Array.isArray(parsed.docIds) ? parsed.docIds : [],
+      allowDraft: parsed.allowDraft === true,
+      allowExpired: parsed.allowExpired === true,
+      allowAsOf: parsed.allowAsOf === true,
+    };
+  } catch {
+    return { ...EMPTY_SCOPE };
+  }
+}
+
 export async function loadAgentKeys(): Promise<PersistedAgentKey[]> {
   const { rows } = await getPool().query(
-    `SELECT id, label, key, key_preview, owner_id, source_filter, rate_limit,
+    `SELECT id, label, key, key_preview, owner_id, scope, rate_limit,
             enabled, created_at, last_used_at, usage_count, usage_this_month, month_stamp
      FROM marmot_agent_keys
      ORDER BY created_at`
@@ -1380,7 +1565,7 @@ export async function loadAgentKeys(): Promise<PersistedAgentKey[]> {
     key: r.key,
     keyPreview: r.key_preview,
     ownerId: r.owner_id,
-    sourceFilter: JSON.parse(r.source_filter ?? "[]"),
+    scope: parseScope(r.scope),
     rateLimit: r.rate_limit,
     enabled: r.enabled,
     createdAt: r.created_at,
@@ -1394,7 +1579,7 @@ export async function loadAgentKeys(): Promise<PersistedAgentKey[]> {
 export async function upsertAgentKey(k: PersistedAgentKey): Promise<void> {
   await getPool().query(
     `INSERT INTO marmot_agent_keys
-       (id, label, key, key_preview, owner_id, source_filter, rate_limit, enabled,
+       (id, label, key, key_preview, owner_id, scope, rate_limit, enabled,
         created_at, last_used_at, usage_count, usage_this_month, month_stamp)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      ON CONFLICT (id) DO UPDATE
@@ -1402,7 +1587,7 @@ export async function upsertAgentKey(k: PersistedAgentKey): Promise<void> {
            key               = EXCLUDED.key,
            key_preview       = EXCLUDED.key_preview,
            owner_id          = EXCLUDED.owner_id,
-           source_filter     = EXCLUDED.source_filter,
+           scope             = EXCLUDED.scope,
            rate_limit        = EXCLUDED.rate_limit,
            enabled           = EXCLUDED.enabled,
            created_at        = EXCLUDED.created_at,
@@ -1410,7 +1595,7 @@ export async function upsertAgentKey(k: PersistedAgentKey): Promise<void> {
            usage_count       = EXCLUDED.usage_count,
            usage_this_month  = EXCLUDED.usage_this_month,
            month_stamp       = EXCLUDED.month_stamp`,
-    [k.id, k.label, k.key, k.keyPreview, k.ownerId, JSON.stringify(k.sourceFilter),
+    [k.id, k.label, k.key, k.keyPreview, k.ownerId, JSON.stringify(k.scope),
      k.rateLimit, k.enabled, k.createdAt, k.lastUsedAt, k.usageCount, k.usageThisMonth, k.monthStamp]
   );
 }
@@ -1579,4 +1764,92 @@ export async function deleteUserById(id: string): Promise<void> {
 export async function countUsers(): Promise<number> {
   const { rows } = await getPool().query("SELECT COUNT(*)::int AS n FROM marmot_users");
   return rows[0].n;
+}
+
+// ── Authentication helpers ────────────────────────────────────────────
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  passwordHash: string;
+  tokenVersion: number;
+}
+
+function mapAuthUser(r: Record<string, unknown>): AuthUser {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    email: r.email as string,
+    role: r.role as string,
+    passwordHash: (r.password_hash as string | null) ?? "",
+    tokenVersion: Number(r.token_version ?? 0),
+  };
+}
+
+export async function findUserByEmail(email: string): Promise<AuthUser | null> {
+  const { rows } = await getPool().query(
+    `SELECT id, name, email, role, password_hash, token_version
+       FROM marmot_users WHERE lower(email) = lower($1) LIMIT 1`,
+    [email]
+  );
+  return rows.length > 0 ? mapAuthUser(rows[0]) : null;
+}
+
+export async function findUserById(id: string): Promise<AuthUser | null> {
+  const { rows } = await getPool().query(
+    `SELECT id, name, email, role, password_hash, token_version
+       FROM marmot_users WHERE id = $1 LIMIT 1`,
+    [id]
+  );
+  return rows.length > 0 ? mapAuthUser(rows[0]) : null;
+}
+
+/** The single account that may sign in to the console. */
+export async function findAdminUser(): Promise<AuthUser | null> {
+  const { rows } = await getPool().query(
+    `SELECT id, name, email, role, password_hash, token_version
+       FROM marmot_users
+      WHERE role ILIKE '%admin%'
+      ORDER BY id LIMIT 1`
+  );
+  return rows.length > 0 ? mapAuthUser(rows[0]) : null;
+}
+
+/** Set a password and invalidate every session issued before the change. */
+export async function setUserPassword(id: string, passwordHash: string): Promise<void> {
+  await getPool().query(
+    `UPDATE marmot_users
+        SET password_hash = $2, token_version = token_version + 1
+      WHERE id = $1`,
+    [id, passwordHash]
+  );
+}
+
+export async function touchUserLogin(id: string): Promise<void> {
+  await getPool().query(
+    "UPDATE marmot_users SET last_login = $2 WHERE id = $1",
+    [id, new Date().toISOString()]
+  );
+}
+
+export async function updateUserEmail(id: string, email: string): Promise<void> {
+  await getPool().query("UPDATE marmot_users SET email = $2 WHERE id = $1", [id, email]);
+}
+
+/** Load-or-create the HMAC secret used to sign session cookies. */
+export async function ensureSessionSecret(): Promise<string> {
+  const pool = getPool();
+  const existing = await pool.query("SELECT value FROM marmot_config WHERE key = 'session_secret'");
+  if (existing.rows.length > 0 && String(existing.rows[0].value).length >= 32) {
+    return String(existing.rows[0].value);
+  }
+  const secret = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
+  await pool.query(
+    `INSERT INTO marmot_config (key, value) VALUES ('session_secret', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [secret]
+  );
+  return secret;
 }

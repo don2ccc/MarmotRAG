@@ -14,7 +14,7 @@ import { retrieveCore, type RetrievalMode } from "../retrieval.js";
 import { ingestText } from "../ingest.js";
 import { store, recordQueryLog } from "../store.js";
 import { createAgentAuth } from "../auth.js";
-import type { AgentApiKey, QueryLog } from "../types";
+import { EMPTY_SCOPE, type AgentApiKey, type KeyScope, type QueryLog } from "../types.js";
 
 /** Max content length for the sync ingest endpoint (memory-sized payloads). */
 const AGENT_WRITE_MAX_CONTENT = 50_000;
@@ -45,7 +45,38 @@ export function maskKey(key: string): string {
 
 function toPublic(k: AgentApiKey) {
   const { key: _secret, _monthStamp: _ms, ...pub } = k;
-  return pub;
+  // `sourceFilter` is a read-only mirror of scope.docIds, kept so the existing
+  // dashboard keeps working until the scope builder UI lands.
+  return { ...pub, sourceFilter: k.scope.docIds };
+}
+
+/** Normalise a scope payload; unknown fields are dropped and arrays trimmed. */
+function parseScope(value: unknown): KeyScope {
+  if (!value || typeof value !== "object") return { ...EMPTY_SCOPE };
+  const raw = value as Record<string, unknown>;
+  const strings = (input: unknown): string[] =>
+    Array.isArray(input) ? input.filter((v): v is string => typeof v === "string").slice(0, 100) : [];
+  return {
+    all: raw.all === true,
+    collections: strings(raw.collections),
+    kinds: strings(raw.kinds),
+    tags: strings(raw.tags),
+    docIds: strings(raw.docIds),
+    allowDraft: raw.allowDraft === true,
+    allowExpired: raw.allowExpired === true,
+    allowAsOf: raw.allowAsOf === true,
+  };
+}
+
+/** True when a single document falls inside the key's scope. */
+function scopeAllowsDocument(scope: KeyScope, detail: SourceDetail): boolean {
+  if (scope.all) return true;
+  const okCollection = scope.collections.length === 0
+    || (!!detail.collectionId && scope.collections.includes(detail.collectionId));
+  const okKind = scope.kinds.length === 0 || scope.kinds.includes(detail.kind);
+  const okTags = scope.tags.length === 0 || scope.tags.some(tag => detail.tags.includes(tag));
+  const okDoc = scope.docIds.length === 0 || scope.docIds.includes(detail.id);
+  return okCollection && okKind && okTags && okDoc;
 }
 
 /** ISO timestamp from a date-ish string; throws on an unparseable value. */
@@ -65,12 +96,9 @@ function parseVersion(value: unknown): number | undefined {
   return Number.isFinite(n) ? Math.trunc(n) : undefined;
 }
 
-/** Agent keys may only read documents their key is allowed to see. */
+/** Agent keys may only read documents their scope allows. */
 function keyCanSee(key: AgentApiKey, detail: SourceDetail): boolean {
-  const visible = detail.ownerId === key.ownerId || detail.isShared;
-  if (!visible) return false;
-  if (key.sourceFilter.length === 0) return true;
-  return key.sourceFilter.includes(detail.id);
+  return scopeAllowsDocument(key.scope, detail);
 }
 
 export function createAgentRouter(): Router {
@@ -89,19 +117,26 @@ export function createAgentRouter(): Router {
 
   r.post("/agent/keys", async (req, res) => {
     const user = currentUser(req);
-    const { label, sourceFilter, rateLimit } = req.body ?? {};
+    const { label, scope, sourceFilter, rateLimit } = req.body ?? {};
     const safeLabel = typeof label === "string" ? label.slice(0, 200).trim() : "";
     if (!safeLabel) {
       res.status(400).json({ error: "label is required" });
       return;
     }
-    // Only allow source ids the user can actually see.
-    const visibleIds = new Set(
-      store.sources.filter(s => s.ownerId === user.id || s.isShared).map(s => s.id)
-    );
-    const allowed = Array.isArray(sourceFilter)
-      ? sourceFilter.slice(0, 50).filter((id: unknown) => typeof id === "string" && visibleIds.has(id))
-      : [];
+
+    // `scope` is the real contract. `sourceFilter` is the deprecated flat
+    // allowlist the old dashboard sends; an empty list there used to mean
+    // "everything", so it keeps that meaning for compatibility only.
+    const parsedScope: KeyScope = scope !== undefined
+      ? parseScope(scope)
+      : Array.isArray(sourceFilter)
+        ? {
+            ...EMPTY_SCOPE,
+            all: sourceFilter.length === 0,
+            docIds: sourceFilter.filter((id: unknown): id is string => typeof id === "string").slice(0, 100),
+          }
+        : { ...EMPTY_SCOPE };
+
     const fullKey = generateApiKey();
     const newKey: AgentApiKey = {
       id: `akey-${Date.now()}`,
@@ -109,7 +144,7 @@ export function createAgentRouter(): Router {
       key: fullKey,
       keyPreview: maskKey(fullKey),
       ownerId: user.id,
-      sourceFilter: allowed,
+      scope: parsedScope,
       rateLimit: Math.max(0, Math.min(600, Number(rateLimit) || 60)),
       enabled: true,
       createdAt: new Date().toISOString(),
@@ -127,9 +162,17 @@ export function createAgentRouter(): Router {
     const user = currentUser(req);
     const key = store.agentKeys.find(k => k.id === req.params.id);
     if (!key || key.ownerId !== user.id) { res.status(404).json({ error: "Key not found" }); return; }
-    const { label, sourceFilter, rateLimit, enabled } = req.body ?? {};
+    const { label, scope, sourceFilter, rateLimit, enabled } = req.body ?? {};
     if (label !== undefined) key.label = String(label).slice(0, 200);
-    if (Array.isArray(sourceFilter)) key.sourceFilter = sourceFilter.slice(0, 50);
+    if (scope !== undefined) {
+      key.scope = parseScope(scope);
+    } else if (Array.isArray(sourceFilter)) {
+      key.scope = {
+        ...key.scope,
+        all: sourceFilter.length === 0,
+        docIds: sourceFilter.filter((id: unknown): id is string => typeof id === "string").slice(0, 100),
+      };
+    }
     if (typeof rateLimit === "number") key.rateLimit = Math.max(0, Math.min(600, rateLimit));
     if (typeof enabled === "boolean") key.enabled = enabled;
     await upsertAgentKey({ ...key, monthStamp: key._monthStamp });
@@ -165,7 +208,8 @@ export function createAgentRouter(): Router {
   r.post("/agent/retrieve", agentAuth, async (req, res) => {
     const key = (req as any).agentKey as AgentApiKey;
     const {
-      query, topK, minScore, sourceFilter, kinds, docIds, asOf, includeExpired, mode, diversity,
+      query, topK, minScore, collections, kinds, tags, docIds,
+      asOf, includeExpired, includeDraft, mode, diversity,
     } = req.body ?? {};
 
     if (!query || typeof query !== "string" || !query.trim()) {
@@ -176,19 +220,29 @@ export function createAgentRouter(): Router {
       res.status(400).json({ error: "Query exceeds maximum length of 10,000 characters." });
       return;
     }
+    if (typeof asOf === "string" && !key.scope.allowAsOf) {
+      res.status(403).json({
+        error: "This API key is not allowed to query historical versions (asOf).",
+      });
+      return;
+    }
+
+    const strings = (value: unknown): string[] | undefined =>
+      Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : undefined;
 
     try {
       const result = await retrieveCore({
         query,
-        userId: key.ownerId,
         topK: typeof topK === "number" ? topK : undefined,
         minScore: typeof minScore === "number" ? minScore : undefined,
-        sourceFilter: Array.isArray(sourceFilter) ? sourceFilter : undefined,
-        extraSourceFilter: key.sourceFilter,
-        kinds: Array.isArray(kinds) ? kinds.filter((k: unknown) => typeof k === "string") : undefined,
-        docIds: Array.isArray(docIds) ? docIds.filter((d: unknown) => typeof d === "string") : undefined,
+        scope: key.scope,
+        collections: strings(collections),
+        kinds: strings(kinds),
+        tags: strings(tags),
+        docIds: strings(docIds),
         asOf: typeof asOf === "string" ? asOf : null,
         includeExpired: includeExpired === true,
+        includeDraft: includeDraft === true,
         mode: (["fast", "balanced", "deep"] as RetrievalMode[]).includes(mode) ? mode : undefined,
         diversity: typeof diversity === "number" ? diversity : undefined,
       });
@@ -361,7 +415,6 @@ export function createAgentRouter(): Router {
           signedAt: meta.signedAt ?? null,
         });
 
-        await registerSourceWithKey(key, result.sourceId);
         res.status(201).json({
           sourceId: result.sourceId,
           name: displayName,
@@ -369,7 +422,6 @@ export function createAgentRouter(): Router {
           chunkCount: result.chunkCount,
           status: "Synced",
           created: true,
-          sourceFilterUpdated: key.sourceFilter.includes(result.sourceId),
         });
         return;
       }
@@ -448,7 +500,6 @@ export function createAgentRouter(): Router {
         replaceExisting: true,
       });
 
-      await registerSourceWithKey(key, result.sourceId);
       res.status(200).json({
         sourceId: result.sourceId,
         name: displayName,
@@ -464,13 +515,6 @@ export function createAgentRouter(): Router {
       res.status(500).json({ error: `Ingest failed: ${reason}` });
     }
   });
-
-  /** Ensure the writing key can retrieve what it just stored. */
-  async function registerSourceWithKey(key: AgentApiKey, sourceId: string): Promise<void> {
-    if (key.sourceFilter.length === 0 || key.sourceFilter.includes(sourceId)) return;
-    key.sourceFilter.push(sourceId);
-    await upsertAgentKey({ ...key, monthStamp: key._monthStamp });
-  }
 
   return r;
 }

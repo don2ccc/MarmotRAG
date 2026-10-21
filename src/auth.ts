@@ -1,23 +1,49 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
-import type { AgentApiKey } from "./types";
-import type { PersistedUser } from "./db";
+import type { AgentApiKey } from "./types.js";
+import type { PersistedUser } from "./db.js";
+import { findUserById } from "./db.js";
+import { sessionTokenFromRequest, verifySession } from "./session.js";
 
 /**
- * Demo-mode user resolution. Reads `X-User-Id`, falls back to the first user.
- * Future real authentication only needs to replace this middleware
- * (e.g. session/JWT that sets req.user the same way).
+ * Admin-only gate for the dashboard API.
+ *
+ * A request is accepted when it carries a valid signed session (cookie, or a
+ * bearer token returned by /api/auth/login) whose user still exists and whose
+ * `token_version` matches — changing the password therefore revokes old
+ * sessions. Requests carrying X-API-Key are delegated to the agent middleware,
+ * which has its own auth and scope.
  */
-export function createResolveUser(getUsers: () => PersistedUser[]): RequestHandler {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const users = getUsers();
-    if (users.length === 0) {
-      res.status(503).json({ error: "No users configured." });
+export function createRequireAdmin(): RequestHandler {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    if (typeof req.headers["x-api-key"] === "string") {
+      next();
       return;
     }
-    const header = req.headers["x-user-id"];
-    const user = typeof header === "string" ? users.find(u => u.id === header) : undefined;
-    (req as any).user = user ?? users[0];
-    next();
+
+    const payload = verifySession(sessionTokenFromRequest(req));
+    if (!payload) {
+      res.status(401).json({ error: "Sign in required." });
+      return;
+    }
+
+    try {
+      const user = await findUserById(payload.uid);
+      if (!user || user.tokenVersion !== payload.ver) {
+        res.status(401).json({ error: "Session is no longer valid. Sign in again." });
+        return;
+      }
+      (req as { user?: PersistedUser }).user = {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        lastLogin: "",
+      };
+      next();
+    } catch (err) {
+      console.error("[auth] session lookup failed:", err);
+      res.status(500).json({ error: "Authentication failed." });
+    }
   };
 }
 
@@ -72,17 +98,7 @@ export function createAgentAuth(deps: {
     keyRecord.usageThisMonth++;
     deps.persistKey({ ...keyRecord }).catch(() => {});
 
-    (req as any).agentKey = keyRecord;
+    (req as { agentKey?: AgentApiKey }).agentKey = keyRecord;
     next();
   };
-}
-
-/** 403 helper for non-owner access. */
-export function denyIfNotOwner(ownerId: string, req: Request, res: Response): boolean {
-  const user = (req as any).user as PersistedUser;
-  if (!user || user.id !== ownerId) {
-    res.status(403).json({ error: "Only the owner can modify this resource." });
-    return true;
-  }
-  return false;
 }

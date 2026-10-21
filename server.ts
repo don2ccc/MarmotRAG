@@ -12,9 +12,14 @@ import {
   loadAgentKeys, upsertAgentKey, countAgentKeys,
   loadQueryLogs, insertQueryLog, queryLogsPaginated,
   loadUsers, upsertUser, countUsers, closePool,
+  ensureSessionSecret, findAdminUser, setUserPassword, updateUserEmail,
 } from "./src/db.js";
 import { indexSource, policyFromConfig, rebuildMissingVersions } from "./src/indexing.js";
-import { createResolveUser } from "./src/auth.js";
+import { createRequireAdmin } from "./src/auth.js";
+import { configureSessionSecret } from "./src/session.js";
+import { hashPassword } from "./src/password.js";
+import { createAuthRouter } from "./src/routes/auth.js";
+import { randomBytes } from "node:crypto";
 import { store } from "./src/store.js";
 import { createSourcesRouter } from "./src/routes/sources.js";
 import { createAgentRouter, maskKey } from "./src/routes/agent.js";
@@ -51,8 +56,17 @@ app.use(express.json({ limit: "2mb" }));
 // HTTP request logging — concise in dev, combined in production
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// ── Demo identity: resolve X-User-Id → req.user (swap for session/JWT later) ──
-app.use(createResolveUser(() => store.users));
+// ── Admin-only console API (agent endpoints use X-API-Key instead) ──────
+const requireAdmin = createRequireAdmin();
+app.use("/api/auth", createAuthRouter());
+app.use("/api", (req, res, next) => {
+  // Health and API docs stay public; everything else is admin or agent-key.
+  if (req.path === "/health" || req.path === "/docs" || req.path === "/openapi.json") {
+    next();
+    return;
+  }
+  requireAdmin(req, res, next);
+});
 
 // ── Seed documents — written to DB only when marmot_sources is empty ─────
 const SEED_SOURCES: Omit<SourceDoc, "chunks">[] = [
@@ -173,7 +187,16 @@ const SEED_AGENT_KEYS: AgentApiKey[] = [
     key: "mrmk_demo_0000000000000000000000000000000000000000000000000000000000000000",
     keyPreview: "mrmk_demo_****...****0000",
     ownerId: "u-1",
-    sourceFilter: [],
+    scope: {
+      all: true,
+      collections: [],
+      kinds: [],
+      tags: [],
+      docIds: [],
+      allowDraft: false,
+      allowExpired: false,
+      allowAsOf: true,
+    },
     rateLimit: 60,
     enabled: true,
     createdAt: new Date(Date.now() - 86400000 * 5).toISOString(),
@@ -218,6 +241,33 @@ async function initializeState(): Promise<void> {
   }
   store.users = await loadUsers();
   console.log(`[users] Loaded ${store.users.length} user(s) from DB`);
+
+  // ── Authentication bootstrap ─────────────────────────────────────────
+  configureSessionSecret(await ensureSessionSecret());
+  const admin = await findAdminUser();
+  if (!admin) {
+    console.warn("[auth] No admin user exists — signing in is impossible until one is created.");
+  } else {
+    if (process.env.ADMIN_EMAIL && process.env.ADMIN_EMAIL.trim().toLowerCase() !== admin.email.toLowerCase()) {
+      await updateUserEmail(admin.id, process.env.ADMIN_EMAIL.trim().toLowerCase());
+      admin.email = process.env.ADMIN_EMAIL.trim().toLowerCase();
+      console.log(`[auth] Admin email set to ${admin.email}`);
+    }
+    if (!admin.passwordHash) {
+      const fromEnv = process.env.ADMIN_PASSWORD?.trim();
+      const password = fromEnv || randomBytes(9).toString("base64url");
+      await setUserPassword(admin.id, hashPassword(password));
+      if (fromEnv) {
+        console.log(`[auth] Admin password initialised for ${admin.email}`);
+      } else {
+        console.warn(
+          `[auth] Generated admin password for ${admin.email}: ${password}\n` +
+          `[auth] Set ADMIN_PASSWORD (and ADMIN_EMAIL) to choose your own, then change it in the UI.`
+        );
+      }
+    }
+    console.log(`[auth] Sign in with ${admin.email}`);
+  }
 
   // Sources
   const existing = await countSources();

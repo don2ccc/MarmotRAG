@@ -1,11 +1,10 @@
 import React, { useEffect, useState } from "react";
 import {
   LayoutDashboard, Sliders, FileText, Shield, Flame, Key, Sun, Moon, RefreshCw,
-  CheckCircle, AlertTriangle, Info, Server,
+  CheckCircle, AlertTriangle, Info, Server, LogOut,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { apiFetch } from "./api";
-import UserSwitcher from "./components/UserSwitcher";
 import DashboardTab from "./tabs/DashboardTab";
 import WorkspaceTab from "./tabs/WorkspaceTab";
 import KnowledgeBaseTab from "./tabs/KnowledgeBaseTab";
@@ -31,6 +30,11 @@ export default function App() {
   const [sources, setSources] = useState<SourceDoc[]>([]);
   const [indexingProgress, setIndexingProgress] = useState<Record<string, IndexingProgress>>({});
   const [isAppLoading, setIsAppLoading] = useState(true);
+  const [authUser, setAuthUser] = useState<UserInfo | null>(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [isSigningIn, setIsSigningIn] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [confirmModal, setConfirmModal] = useState<{ title: string; message: string; onConfirm: () => void } | null>(null);
 
@@ -45,26 +49,40 @@ export default function App() {
 
   const loadSources = (userId: string) => {
     apiFetch(userId, "/api/sources")
-      .then(r => r.json())
-      .then((d: { sources: SourceDoc[] }) => setSources(d.sources ?? []))
+      .then(async r => {
+        if (r.status === 401) { setAuthUser(null); return; }
+        const d = await r.json() as { sources: SourceDoc[] };
+        setSources(d.sources ?? []);
+      })
       .catch(() => {});
   };
 
   useEffect(() => {
-    apiFetch("u-1", "/api/users")
-      .then(r => r.json())
-      .then((u: UserInfo[]) => {
-        setUsers(u);
-        if (u.length > 0 && !u.some(x => x.id === currentUserId)) setCurrentUserId(u[0].id);
-      })
-      .catch(() => {})
-      .finally(() => setIsAppLoading(false));
+    (async () => {
+      try {
+        const me = await apiFetch("u-1", "/api/auth/me");
+        if (!me.ok) { setAuthUser(null); return; }
+        const { user } = await me.json() as { user: UserInfo };
+        setAuthUser(user);
+        setCurrentUserId(user.id);
+        const r = await apiFetch("u-1", "/api/users");
+        if (r.ok) {
+          const u = await r.json() as UserInfo[];
+          setUsers(u);
+        }
+      } catch {
+        setAuthUser(null);
+      } finally {
+        setIsAppLoading(false);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (users.length > 0) loadSources(currentUserId);
-  }, [currentUserId, users.length]);
+    if (authUser) loadSources(currentUserId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId, authUser?.id]);
 
   useEffect(() => {
     if (themeMode === "light") {
@@ -75,6 +93,91 @@ export default function App() {
       document.body.classList.remove("theme-light");
     }
   }, [themeMode]);
+
+  const signIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError("");
+    setIsSigningIn(true);
+    try {
+      const res = await apiFetch("u-1", "/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email: loginEmail.trim(), password: loginPassword }),
+      });
+      const data = await res.json().catch(() => ({})) as { error?: string };
+      if (!res.ok) {
+        setLoginError(data.error ?? "Sign-in failed.");
+        return;
+      }
+      window.location.reload();
+    } catch {
+      setLoginError("Cannot reach the server.");
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
+
+  const signOut = async () => {
+    await apiFetch("u-1", "/api/auth/logout", { method: "POST" }).catch(() => {});
+    window.location.reload();
+  };
+
+  if (!isAppLoading && !authUser) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#0B0D10] text-white p-6">
+        <form onSubmit={signIn} className="w-full max-w-sm bg-[#131720] border border-white/10 rounded-xl p-6 space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 bg-[#86C9A4] rounded-full flex items-center justify-center">
+              <span className="font-display text-base font-extrabold text-black">M</span>
+            </div>
+            <div>
+              <h1 className="text-sm font-bold tracking-wide">MarmotRAG Admin</h1>
+              <p className="font-mono text-[9px] text-white/45 uppercase tracking-widest">Knowledge base console</p>
+            </div>
+          </div>
+
+          <label className="block space-y-1">
+            <span className="font-mono text-[9px] uppercase tracking-widest text-white/50">Email</span>
+            <input
+              type="email"
+              value={loginEmail}
+              onChange={e => setLoginEmail(e.target.value)}
+              autoComplete="username"
+              className="w-full px-3 py-2.5 bg-[#0E1218] border border-white/10 rounded-lg text-sm text-white focus:outline-none focus:ring-1 focus:ring-[#86C9A4]"
+              autoFocus
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="font-mono text-[9px] uppercase tracking-widest text-white/50">Password</span>
+            <input
+              type="password"
+              value={loginPassword}
+              onChange={e => setLoginPassword(e.target.value)}
+              autoComplete="current-password"
+              className="w-full px-3 py-2.5 bg-[#0E1218] border border-white/10 rounded-lg text-sm text-white focus:outline-none focus:ring-1 focus:ring-[#86C9A4]"
+            />
+          </label>
+
+          {loginError && (
+            <p className="font-mono text-[10px] text-red-300/90 leading-relaxed">{loginError}</p>
+          )}
+
+          <button
+            type="submit"
+            disabled={isSigningIn || !loginEmail.trim() || !loginPassword}
+            className="w-full py-2.5 bg-[#86C9A4] text-black text-xs font-bold uppercase tracking-widest rounded-lg disabled:opacity-40 cursor-pointer"
+          >
+            {isSigningIn ? "Signing in…" : "Sign in"}
+          </button>
+
+          <p className="font-mono text-[9px] text-white/35 leading-relaxed">
+            Admin-only console. Credentials are managed on the server; the first password is printed at startup
+            (or set <span className="text-white/60">ADMIN_PASSWORD</span>).
+          </p>
+        </form>
+      </div>
+    );
+  }
 
   if (isAppLoading) {
     return (
@@ -160,8 +263,20 @@ export default function App() {
           </div>
         </div>
 
-        <div className="px-1">
-          <UserSwitcher users={users} currentUserId={currentUserId} onSwitch={setCurrentUserId} />
+        <div className="px-1 flex items-center gap-2">
+          <div className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-2">
+            <p className="text-[11px] font-bold text-white truncate">{authUser?.name ?? "Administrator"}</p>
+            <p className="font-mono text-[9px] text-white/50 uppercase tracking-wider truncate">
+              {authUser?.email ?? ""}
+            </p>
+          </div>
+          <button
+            onClick={signOut}
+            title="Sign out"
+            className="shrink-0 p-2 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-white/60 hover:text-white cursor-pointer"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         <nav className="flex-1 space-y-1.5">
@@ -207,9 +322,13 @@ export default function App() {
             <h1 className="font-display text-xs font-bold uppercase text-white leading-none">Marmot RAG</h1>
             <p className="font-mono text-[8px] text-[#86C9A4] uppercase font-bold mt-1">Retrieval Service</p>
           </div>
-          <div className="w-36">
-            <UserSwitcher users={users} currentUserId={currentUserId} onSwitch={setCurrentUserId} compact />
-          </div>
+          <button
+            onClick={signOut}
+            title="Sign out"
+            className="shrink-0 p-2 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-white/60 hover:text-white cursor-pointer"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         {activeTab === "dashboard" && <DashboardTab userId={currentUserId} />}

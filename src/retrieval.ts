@@ -6,6 +6,7 @@ import {
   type SearchFilter,
 } from "./db.js";
 import { chunkText, countTokens, chunkWithPolicy, resolvePolicy } from "./chunking.js";
+import type { KeyScope } from "./types.js";
 
 // Chunking and token counting live in ./chunking.ts (pure, unit-tested).
 // Re-exported here because existing callers import them from retrieval.
@@ -75,15 +76,18 @@ export type RetrievalMode = "fast" | "balanced" | "deep";
 
 export interface RetrieveOptions {
   query: string;
-  userId: string;
   topK?: number;                 // default 5, clamped 1..50
   minScore?: number;             // default 0, clamped 0..1
-  sourceFilter?: string[];       // caller-level allowlist
-  extraSourceFilter?: string[];  // agent-key-level allowlist (intersected)
-  kinds?: string[];              // policy | process | contract | template | ...
+  /** API-key scope. Omitted = admin (unrestricted). */
+  scope?: KeyScope;
+  /** Request-level narrowing; can only shrink the scope, never widen it. */
+  collections?: string[];
+  kinds?: string[];
+  tags?: string[];
   docIds?: string[];
   asOf?: string | null;          // ISO timestamp: ask the past
   includeExpired?: boolean;
+  includeDraft?: boolean;
   mode?: RetrievalMode;
   /** 0 = pure relevance, 1 = maximum diversity. Default 0.7 relevance. */
   diversity?: number;
@@ -282,20 +286,46 @@ export async function retrieveCore(opts: RetrieveOptions): Promise<RetrieveResul
   const preset = MODE_PRESETS[mode] ?? MODE_PRESETS.balanced;
   const lambda = Math.max(0, Math.min(1, opts.diversity ?? 0.7));
 
-  const caller = opts.sourceFilter?.length ? opts.sourceFilter : undefined;
-  const extra = opts.extraSourceFilter?.length ? opts.extraSourceFilter : undefined;
-  const effectiveFilter = caller && extra
-    ? caller.filter(id => extra.includes(id))
-    : (caller ?? extra);
+  const scope = opts.scope;
+  const scoped = scope ? !scope.all : false;
+
+  /** Request filters may only shrink the key's scope, never widen it. */
+  const narrow = (allowed?: string[], requested?: string[]): string[] | undefined => {
+    if (!requested?.length) return allowed?.length ? allowed : undefined;
+    if (!allowed?.length) return requested;
+    return requested.filter(value => allowed.includes(value));
+  };
+
+  const collections = narrow(scope?.collections, opts.collections);
+  const kinds = narrow(scope?.kinds, opts.kinds);
+  const tags = narrow(scope?.tags, opts.tags);
+  const docIds = narrow(scope?.docIds, opts.docIds);
 
   const filter: SearchFilter = {
-    userId: opts.userId,
-    sourceFilter: effectiveFilter,
-    kinds: opts.kinds,
-    docIds: opts.docIds,
+    scopeAll: !scoped,
+    collections: scoped ? collections : opts.collections,
+    kinds: scoped ? kinds : opts.kinds,
+    tags: scoped ? tags : opts.tags,
+    docIds: scoped ? docIds : opts.docIds,
     asOf: opts.asOf ?? null,
-    includeExpired: opts.includeExpired,
+    includeExpired: opts.includeExpired ?? scope?.allowExpired ?? false,
+    includeDraft: opts.includeDraft ?? scope?.allowDraft ?? false,
   };
+
+  // The request asked for something outside the key's own scope: nothing can
+  // match, so fail closed instead of silently widening.
+  const narrowedPastScope =
+    (scoped && scope!.collections.length > 0 && opts.collections?.length && collections?.length === 0) ||
+    (scoped && scope!.kinds.length > 0 && opts.kinds?.length && kinds?.length === 0) ||
+    (scoped && scope!.tags.length > 0 && opts.tags?.length && tags?.length === 0) ||
+    (scoped && scope!.docIds.length > 0 && opts.docIds?.length && docIds?.length === 0);
+  if (narrowedPastScope) {
+    filter.scopeAll = false;
+    filter.collections = [];
+    filter.kinds = [];
+    filter.tags = [];
+    filter.docIds = ["__outside_scope__"];
+  }
 
   const lexicalKeys = extractLexicalKeys(opts.query);
   const candidateDepth = Math.min(200, topK * preset.multiplier);
