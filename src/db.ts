@@ -757,10 +757,32 @@ export async function beginVersion(docId: string, meta: VersionMeta): Promise<st
   if (exists.rows.length === 0) throw new Error(`document ${docId} not found`);
 
   const building = await pool.query(
-    "SELECT id FROM marmot_doc_versions WHERE doc_id = $1 AND state = 'building' LIMIT 1",
+    `SELECT id, created_at
+       FROM marmot_doc_versions
+      WHERE doc_id = $1 AND state = 'building'
+      ORDER BY created_at DESC
+      LIMIT 1`,
     [docId]
   );
-  if (building.rows.length > 0) throw new VersionInProgressError(docId);
+  if (building.rows.length > 0) {
+    const startedAt = new Date(building.rows[0].created_at as string).getTime();
+    const staleAfterMs = Number(process.env.BUILD_STALE_MS ?? 15 * 60 * 1000) || 15 * 60 * 1000;
+    if (Date.now() - startedAt < staleAfterMs) throw new VersionInProgressError(docId);
+
+    // A build that outlived any plausible embedding request is abandoned: the
+    // client disconnected, or the process died and the row survived. Take it
+    // over instead of blocking re-index until the next restart.
+    const abandonedId = building.rows[0].id as string;
+    await pool.query("DELETE FROM marmot_chunks WHERE version_id = $1", [abandonedId]);
+    await pool.query(
+      "UPDATE marmot_doc_versions SET state = 'failed', last_error = $2 WHERE id = $1",
+      [abandonedId, "abandoned build taken over by a newer request"]
+    );
+    console.warn(
+      `[version] took over an abandoned build for ${docId} ` +
+      `(started ${new Date(startedAt).toISOString()})`
+    );
+  }
 
   const versionId = `ver-${randomUUID()}`;
   await pool.query(
@@ -886,10 +908,16 @@ export async function recoverInterruptedVersions(): Promise<{ interrupted: numbe
     `UPDATE marmot_sources s
         SET current_version_id = NULL, status = 'Paused'
       WHERE s.current_version_id IS NOT NULL
-        AND NOT EXISTS (
-              SELECT 1 FROM marmot_doc_versions v
-               WHERE v.id = s.current_version_id AND v.state = 'active'
-            )`
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM marmot_doc_versions v
+             WHERE v.id = s.current_version_id AND v.state = 'active'
+          )
+          OR NOT EXISTS (
+            SELECT 1 FROM marmot_chunks c
+             WHERE c.version_id = s.current_version_id
+          )
+        )`
   );
 
   return { interrupted: rows.length, cleared: cleared.rowCount ?? 0 };
@@ -909,6 +937,8 @@ export interface DocVersionState {
   lifecycle: string | null;
   effectiveFrom: string | null;
   effectiveTo: string | null;
+  /** Reason the most recent failed build failed (shown in the dashboard). */
+  lastError: string | null;
 }
 
 /** Startup view of every document, its current version and version count. */
@@ -917,7 +947,12 @@ export async function loadVersionStates(): Promise<DocVersionState[]> {
     `SELECT s.id, s.name, s.status, s.current_version_id, s.vectors_count,
             s.kind, s.doc_no, length(s.content) AS content_length,
             v.version_no, v.lifecycle, v.effective_from, v.effective_to,
-            (SELECT count(*)::int FROM marmot_doc_versions dv WHERE dv.doc_id = s.id) AS version_count
+            (SELECT count(*)::int FROM marmot_doc_versions dv WHERE dv.doc_id = s.id) AS version_count,
+            (SELECT dv.last_error
+               FROM marmot_doc_versions dv
+              WHERE dv.doc_id = s.id AND dv.state = 'failed'
+              ORDER BY dv.created_at DESC
+              LIMIT 1) AS last_error
        FROM marmot_sources s
        LEFT JOIN marmot_doc_versions v ON v.id = s.current_version_id
       ORDER BY s.id`
@@ -936,17 +971,24 @@ export async function loadVersionStates(): Promise<DocVersionState[]> {
     lifecycle: (r.lifecycle as string | null) ?? null,
     effectiveFrom: toIso(r.effective_from),
     effectiveTo: toIso(r.effective_to),
+    lastError: (r.last_error as string | null) ?? null,
   }));
 }
 
-/** Documents with no servable version but stored content to rebuild from. */
+/** Documents with no servable version (missing pointer, or a version with no chunks). */
 export async function listRebuildCandidates(): Promise<{ id: string; name: string }[]> {
   const { rows } = await getPool().query(
-    `SELECT id, name
-       FROM marmot_sources
-      WHERE current_version_id IS NULL
-        AND length(content) > 0
-      ORDER BY id`
+    `SELECT s.id, s.name
+       FROM marmot_sources s
+      WHERE length(s.content) > 0
+        AND (
+          s.current_version_id IS NULL
+          OR NOT EXISTS (
+               SELECT 1 FROM marmot_chunks c
+                WHERE c.version_id = s.current_version_id
+             )
+        )
+      ORDER BY s.id`
   );
   return rows.map(r => ({ id: r.id as string, name: r.name as string }));
 }

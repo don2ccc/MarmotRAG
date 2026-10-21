@@ -203,6 +203,31 @@ try {
   ok("failed attempt recorded as a version", afterFailure.length === 2, `failed=${afterFailure.length}`);
   const stillDoc = (await db.loadVersionStates()).find(s => s.id === DOC_ID);
   ok("document still serves its active version", stillDoc?.currentVersionId === versionB);
+
+  // ── 6. Abandoned build takeover + repair detection ─────────────────
+  console.log("\n6. Recovery");
+  const abandoned = await stageVersion(V3);
+  // Pretend the build hung: any building version is now considered abandoned.
+  process.env.BUILD_STALE_MS = "1";
+  await new Promise(r => setTimeout(r, 20));
+
+  const takeover = await stageVersion(V3);
+  ok("a newer request can take over an abandoned build", !!takeover && takeover !== abandoned);
+  const afterTakeover = await db.listVersions(DOC_ID);
+  ok("the abandoned version is marked failed",
+    afterTakeover.find(v => v.id === abandoned)?.state === "failed",
+    `state=${afterTakeover.find(v => v.id === abandoned)?.state}`);
+  ok("its error explains the takeover",
+    (afterTakeover.find(v => v.id === abandoned)?.lastError ?? "").includes("abandoned"));
+
+  await db.commitVersion({ docId: DOC_ID, versionId: takeover, chunkCount: 1 });
+  delete process.env.BUILD_STALE_MS;
+
+  // A version with no chunks must be treated as "not servable", not as indexed.
+  await db.deleteChunksBySource(DOC_ID);
+  const candidates = await db.listRebuildCandidates();
+  ok("a document whose version has no chunks is queued for rebuild",
+    candidates.some(c => c.id === DOC_ID));
 } finally {
   // ── Cleanup ─────────────────────────────────────────────────────────
   try {

@@ -27,6 +27,8 @@ export interface SourceDoc {
   lifecycle?: string | null;
   effectiveFrom?: string | null;
   effectiveTo?: string | null;
+  /** Reason the last indexing attempt failed, when the document has no version. */
+  lastError?: string | null;
 }
 
 /** Query log — retrieval only (no answer, no scores). */

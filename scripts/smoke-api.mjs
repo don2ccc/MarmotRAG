@@ -272,6 +272,9 @@ try {
     });
     ok("invalid verdict → 400", badVerdict.status === 400, `status ${badVerdict.status}`);
 
+    const rebuild = await req("/api/sources/rebuild-missing", { method: "POST", userId: USER });
+    ok("rebuild-missing endpoint accepted", rebuild.status === 202, `status ${rebuild.status}`);
+
     // ── 10. Re-index keeps the version chain ──────────────────────────
     console.log("\n10. Re-index");
     const reindex = await sse(`/api/sources/${docId}/reindex`, {}, USER);

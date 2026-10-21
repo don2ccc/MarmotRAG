@@ -7,7 +7,7 @@ import {
   type PersistedUser,
 } from "../db.js";
 import { retrieveCore } from "../retrieval.js";
-import { indexSource, planChunks, policyFromConfig } from "../indexing.js";
+import { indexSource, planChunks, policyFromConfig, rebuildMissingVersions } from "../indexing.js";
 import { store, recordQueryLog } from "../store.js";
 import { denyIfNotOwner } from "../auth.js";
 import type { QueryLog, SourceDoc } from "../types";
@@ -97,6 +97,7 @@ export function createSourcesRouter(): Router {
             lifecycle: state.lifecycle,
             effectiveFrom: state.effectiveFrom,
             effectiveTo: state.effectiveTo,
+            lastError: state.lastError,
           }
         : doc;
     });
@@ -187,6 +188,25 @@ export function createSourcesRouter(): Router {
       lifecycle: detail?.lifecycle ?? null,
       effectiveFrom: detail?.effectiveFrom ?? null,
       effectiveTo: detail?.effectiveTo ?? null,
+    });
+  });
+
+  // Repair: rebuild every owned document that has no servable version.
+  // Runs in the background, sequentially — a local embedding server handles one
+  // request at a time, and parallel rebuilds are what caused the timeouts.
+  r.post("/sources/rebuild-missing", async (req, res) => {
+    const user = currentUser(req);
+    const ids = store.sources.filter(s => s.ownerId === user.id).map(s => s.id);
+    void rebuildMissingVersions({ docIds: ids })
+      .then(result => {
+        if (result.total > 0) {
+          console.log(`[rebuild-missing] rebuilt ${result.rebuilt}/${result.total}, failed ${result.failed}`);
+        }
+      })
+      .catch(err => console.error("[rebuild-missing] failed:", err));
+    res.status(202).json({
+      message: "Rebuild started for documents without a servable version.",
+      documents: ids.length,
     });
   });
 

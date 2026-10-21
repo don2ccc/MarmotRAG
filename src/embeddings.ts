@@ -130,6 +130,31 @@ function sanitizeForEmbed(text: string): string {
 }
 
 /**
+ * Per-request embedding timeout.
+ *
+ * The default was 30s, which a local 4B model on CPU can exceed for a long
+ * chunk — and a timed-out chunk fails the whole build. 120s is generous enough
+ * for a cold local model while still bounding a hung server.
+ */
+export function embedTimeoutMs(): number {
+  const n = Number(process.env.EMBED_TIMEOUT_MS ?? 120_000);
+  return Number.isFinite(n) && n > 0 ? n : 120_000;
+}
+
+/**
+ * How many embedding requests are in flight at once.
+ *
+ * Default 1: local servers (LM Studio, a single Ollama model) process one
+ * request at a time, so concurrency just queues work behind a 30s deadline and
+ * turns a slow-but-working server into a wall of timeouts. Raise it for cloud
+ * providers with EMBED_CONCURRENCY.
+ */
+export function embedConcurrency(max = 8): number {
+  const n = Number(process.env.EMBED_CONCURRENCY ?? 1);
+  return Number.isFinite(n) ? Math.max(1, Math.min(max, Math.round(n))) : 1;
+}
+
+/**
  * Embed a single text string using Ollama — low-level, no retry.
  * Throws on network / model error.
  */
@@ -159,7 +184,7 @@ async function embedTextOnce(text: string): Promise<number[]> {
     method: "POST",
     headers: request.headers,
     body: request.body,
-    signal: AbortSignal.timeout(30_000), // 30s timeout per chunk
+    signal: AbortSignal.timeout(embedTimeoutMs()),
   });
 
   if (!response.ok) {
@@ -197,20 +222,30 @@ async function embedTextOnce(text: string): Promise<number[]> {
 }
 
 /**
- * Embed a single text with exponential-backoff retry (up to 3 attempts).
- * Retry delays: 1s → 2s → 4s.
- * Use this for all production embedding calls.
+ * Embed a single text with exponential-backoff retry.
+ *
+ * A timeout is retried once (the first request may have been queued behind a
+ * cold model), then surfaced with an actionable message instead of a bare
+ * DOMException.
  */
-export async function embedText(text: string, maxRetries = 3): Promise<number[]> {
+export async function embedText(text: string, maxRetries = 2): Promise<number[]> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       return await embedTextOnce(text);
     } catch (err) {
-      lastErr = err;
+      const message = err instanceof Error ? err.message : String(err);
+      const isTimeout = /timeout|aborted/i.test(message);
+      lastErr = isTimeout
+        ? new Error(
+            `embedding request exceeded ${embedTimeoutMs()}ms ` +
+            `(chunks ${text.length} chars). Raise EMBED_TIMEOUT_MS, keep EMBED_CONCURRENCY=1, ` +
+            `or use a smaller embedding model. Original: ${message}`
+          )
+        : err;
       if (attempt < maxRetries - 1) {
-        const delayMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
-        console.warn(`[embed] attempt ${attempt + 1} failed, retrying in ${delayMs}ms: ${err}`);
+        const delayMs = 1000 * Math.pow(2, attempt); // 1s, 2s
+        console.warn(`[embed] attempt ${attempt + 1} failed, retrying in ${delayMs}ms: ${message}`);
         await new Promise(r => setTimeout(r, delayMs));
       }
     }
@@ -219,11 +254,11 @@ export async function embedText(text: string, maxRetries = 3): Promise<number[]>
 }
 
 /**
- * Embed multiple texts with bounded concurrency (default: 3 at a time).
+ * Embed multiple texts with bounded concurrency.
  * Returns an array of embeddings in the same order as the input.
  * Each embed uses retry logic via embedText().
  */
-export async function embedTexts(texts: string[], concurrency = 3): Promise<number[][]> {
+export async function embedTexts(texts: string[], concurrency = embedConcurrency()): Promise<number[][]> {
   const results: (number[] | null)[] = new Array(texts.length).fill(null);
   let idx = 0;
 

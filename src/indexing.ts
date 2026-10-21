@@ -14,20 +14,19 @@ import {
   type ChunkPolicy,
   type ChunkPiece,
 } from "./chunking.js";
-import { embedRuntimeConfig, embedTexts, storeDim } from "./embeddings.js";
+import { embedConcurrency, embedRuntimeConfig, embedTexts, storeDim } from "./embeddings.js";
 import {
   abortVersion,
   beginVersion,
   commitVersion,
   insertChunkRows,
+  listRebuildCandidates,
   sha256,
 } from "./db.js";
+import { store } from "./store.js";
 
 /** Chunks embedded per round trip; keeps memory flat on large documents. */
-const EMBED_BATCH = 24;
-
-/** Parallel embedding requests. The local server is the bottleneck, not us. */
-const EMBED_CONCURRENCY = 3;
+const EMBED_BATCH = 12;
 
 export interface IndexSourceOptions {
   sourceId: string;
@@ -106,7 +105,7 @@ export async function indexSource(opts: IndexSourceOptions): Promise<IndexSource
   try {
     for (let start = 0; start < pieces.length; start += EMBED_BATCH) {
       const batch = pieces.slice(start, start + EMBED_BATCH);
-      const embeddings = await embedTexts(batch.map(p => p.text), EMBED_CONCURRENCY);
+      const embeddings = await embedTexts(batch.map(p => p.text), embedConcurrency());
 
       await insertChunkRows(
         versionId,
@@ -128,6 +127,9 @@ export async function indexSource(opts: IndexSourceOptions): Promise<IndexSource
       );
 
       done += batch.length;
+      if (pieces.length > EMBED_BATCH * 2) {
+        console.log(`[index] ${opts.sourceId}: ${done}/${pieces.length} chunks embedded`);
+      }
       opts.onProgress?.(done, pieces.length);
     }
 
@@ -155,4 +157,53 @@ export function policyFromConfig(cfg: {
   separationStrategy?: string;
 }): Required<ChunkPolicy> {
   return resolvePolicy(cfg);
+}
+
+/**
+ * Re-index documents that have no servable version (failed build, interrupted
+ * build, embedding-dimension change).
+ *
+ * Sequential on purpose: a local embedding server handles one request at a
+ * time, and firing several rebuilds at once is exactly what turned a slow model
+ * into a wall of timeouts.
+ */
+export async function rebuildMissingVersions(
+  opts: { docIds?: string[] } = {}
+): Promise<{ total: number; rebuilt: number; failed: number }> {
+  const candidates = await listRebuildCandidates();
+  const selected = opts.docIds?.length
+    ? candidates.filter(candidate => opts.docIds!.includes(candidate.id))
+    : candidates;
+  if (selected.length === 0) return { total: 0, rebuilt: 0, failed: 0 };
+
+  console.log(`[sources] rebuilding ${selected.length} document(s) with no servable version`);
+  let rebuilt = 0;
+  let failed = 0;
+
+  for (const candidate of selected) {
+    const doc = store.sources.find(s => s.id === candidate.id);
+    if (!doc || !doc.content) continue;
+    const policy = policyFromConfig(store.strategyConfig);
+    try {
+      const result = await indexSource({
+        sourceId: doc.id,
+        sourceName: doc.name,
+        content: doc.content,
+        chunkSize: policy.chunkSize,
+        chunkOverlapPercent: policy.chunkOverlapPercent,
+        strategy: policy.strategy,
+      });
+      doc.status = "Synced";
+      doc.vectorsCount = result.chunkCount;
+      doc.lastSync = result.lastSync;
+      doc.versionNo = result.versionNo;
+      rebuilt++;
+      console.log(`[sources] rebuilt "${doc.name}" (${result.chunkCount} chunks)`);
+    } catch (err) {
+      failed++;
+      console.error(`[sources] rebuild failed for "${candidate.name}":`, err);
+    }
+  }
+
+  return { total: selected.length, rebuilt, failed };
 }

@@ -362,6 +362,14 @@ export default function KnowledgeBaseTab(props: Props) {
                                 </span>
                               )}
                             </div>
+                            {s.status !== "Synced" && s.lastError && (
+                              <p
+                                className="font-mono text-[8px] text-red-300/70 truncate max-w-[240px] mt-0.5"
+                                title={s.lastError}
+                              >
+                                {s.lastError}
+                              </p>
+                            )}
                             {progress && (
                               <div className="flex items-center gap-2 mt-1">
                                 <div className="w-24 h-1 bg-white/10 rounded overflow-hidden">

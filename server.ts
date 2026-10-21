@@ -13,7 +13,7 @@ import {
   loadQueryLogs, insertQueryLog, queryLogsPaginated,
   loadUsers, upsertUser, countUsers, closePool,
 } from "./src/db.js";
-import { indexSource, policyFromConfig } from "./src/indexing.js";
+import { indexSource, policyFromConfig, rebuildMissingVersions } from "./src/indexing.js";
 import { createResolveUser } from "./src/auth.js";
 import { store } from "./src/store.js";
 import { createSourcesRouter } from "./src/routes/sources.js";
@@ -347,46 +347,6 @@ async function initializeState(): Promise<void> {
   console.log(`[query-logs] Loaded ${store.queryLogs.length} recent log(s) from DB`);
 }
 
-/**
- * Re-embed every document that has no servable version (embedding-dimension
- * change, interrupted build, rows written before vectors were maintained). Runs
- * after startup, one document at a time, so the service is available immediately
- * and one failure cannot block the rest.
- */
-async function rebuildMissingVersions(): Promise<void> {
-  let candidates: { id: string; name: string }[];
-  try {
-    candidates = await listRebuildCandidates();
-  } catch (err) {
-    console.error("[sources] could not list rebuild candidates:", err);
-    return;
-  }
-  if (candidates.length === 0) return;
-  console.log(`[sources] rebuilding ${candidates.length} stale source(s) in the background`);
-
-  for (const candidate of candidates) {
-    const doc = store.sources.find(s => s.id === candidate.id);
-    if (!doc || !doc.content) continue;
-    const policy = policyFromConfig(store.strategyConfig);
-    try {
-      const result = await indexSource({
-        sourceId: doc.id,
-        sourceName: doc.name,
-        content: doc.content,
-        chunkSize: policy.chunkSize,
-        chunkOverlapPercent: policy.chunkOverlapPercent,
-        strategy: policy.strategy,
-      });
-      doc.status = "Synced";
-      doc.vectorsCount = result.chunkCount;
-      doc.lastSync = result.lastSync;
-      console.log(`[sources] rebuilt "${doc.name}" (${result.chunkCount} chunks)`);
-    } catch (err) {
-      console.error(`[sources] rebuild failed for "${candidate.name}":`, err);
-    }
-  }
-}
-
 // ── OpenAPI for the public agent surface ───────────────────────────────
 const OPENAPI = {
   openapi: "3.0.3",
@@ -592,6 +552,14 @@ async function startServer() {
 
   // Global error handler — catches unhandled errors thrown by route handlers
   app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = Number((err as { status?: number }).status);
+    // body-parser reports client errors (bad JSON, too large) with a 4xx status;
+    // collapsing them into 500 hides the real cause from the caller.
+    if (status >= 400 && status < 500) {
+      console.warn(`[error ${status}]`, err.message);
+      res.status(status).json({ error: err.message || "Invalid request." });
+      return;
+    }
     console.error("[error]", err.stack ?? err.message);
     if ((err as { type?: string }).type === "entity.too.large") {
       res.status(413).json({ error: "File too large. Maximum upload size is 50 MB." });

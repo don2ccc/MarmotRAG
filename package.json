@@ -15,7 +15,8 @@
     "test:smoke": "node scripts/smoke-api.mjs",
     "build:test": "tsc -p tsconfig.test.json",
     "serve:fake-embed": "node scripts/fake-embed-server.mjs",
-    "db:check": "node scripts/probe-db.mjs"
+    "db:check": "node scripts/probe-db.mjs",
+    "db:reset": "node scripts/reset-knowledge.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

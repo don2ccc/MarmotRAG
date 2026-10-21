@@ -35,10 +35,15 @@ const jieba = requireCjs("jieba-wasm") as unknown as {
  * Hard character cap for one chunk.
  *
  * Must stay <= embeddings.MAX_CHARS: that is the length the embedding client
- * accepts before it starts dropping characters. Today it is 8000, so 2000
- * leaves a wide margin while staying comfortable for a 4B embedding model.
+ * accepts before it starts dropping characters. Lower it for a slow local
+ * embedding model (MAX_CHUNK_CHARS=1200 roughly halves per-request latency at
+ * the cost of more chunks).
  */
-export const MAX_CHUNK_CHARS = 2000;
+export const MAX_CHUNK_CHARS = (() => {
+  const raw = Number(process.env.MAX_CHUNK_CHARS ?? 2000);
+  const n = Number.isFinite(raw) ? Math.round(raw) : 2000;
+  return Math.max(200, Math.min(8000, n));
+})();
 
 export const MIN_CHUNK_SIZE = 32;
 export const MAX_CHUNK_SIZE = 2048;
