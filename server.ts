@@ -249,9 +249,17 @@ async function initializeState(): Promise<void> {
     console.warn("[auth] No admin user exists — signing in is impossible until one is created.");
   } else {
     if (process.env.ADMIN_EMAIL && process.env.ADMIN_EMAIL.trim().toLowerCase() !== admin.email.toLowerCase()) {
-      await updateUserEmail(admin.id, process.env.ADMIN_EMAIL.trim().toLowerCase());
-      admin.email = process.env.ADMIN_EMAIL.trim().toLowerCase();
-      console.log(`[auth] Admin email set to ${admin.email}`);
+      // A second admin may already own that email; never let bootstrap crash the boot.
+      try {
+        await updateUserEmail(admin.id, process.env.ADMIN_EMAIL.trim().toLowerCase());
+        admin.email = process.env.ADMIN_EMAIL.trim().toLowerCase();
+        console.log(`[auth] Admin email set to ${admin.email}`);
+      } catch (err) {
+        console.warn(
+          `[auth] Could not set ADMIN_EMAIL (${process.env.ADMIN_EMAIL}): ` +
+          `${err instanceof Error ? err.message : String(err)}. Keeping ${admin.email}.`
+        );
+      }
     }
     if (!admin.passwordHash) {
       const fromEnv = process.env.ADMIN_PASSWORD?.trim();

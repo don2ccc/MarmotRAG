@@ -16,7 +16,8 @@
     "build:test": "tsc -p tsconfig.test.json",
     "serve:fake-embed": "node scripts/fake-embed-server.mjs",
     "db:check": "node scripts/probe-db.mjs",
-    "db:reset": "node scripts/reset-knowledge.mjs"
+    "db:reset": "node scripts/reset-knowledge.mjs",
+    "user:add": "node scripts/add-user.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
